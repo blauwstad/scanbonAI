@@ -121,6 +121,37 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Stripe billing
+    # ------------------------------------------------------------------
+    STRIPE_SECRET_KEY: str = Field(
+        default="", description="Stripe secret API key (sk_test_... or sk_live_...).",
+    )
+    STRIPE_WEBHOOK_SECRET: str = Field(
+        default="", description="Stripe webhook endpoint signing secret (whsec_...).",
+    )
+    STRIPE_PUBLISHABLE_KEY: str = Field(
+        default="", description="Stripe publishable key for frontend (pk_test_... or pk_live_...).",
+    )
+
+    # ------------------------------------------------------------------
+    # Registry APIs (KVK / KBO)
+    # ------------------------------------------------------------------
+    KVK_API_KEY: str = Field(
+        default="", description="API key for KVK (Kamer van Koophandel) registry.",
+    )
+    KVK_BASE_URL: str = Field(
+        default="https://api.kvk.nl/api/v1",
+        description="Base URL for KVK API.",
+    )
+    KBO_API_KEY: str = Field(
+        default="", description="API key for KBO (Belgian business registry).",
+    )
+    KBO_BASE_URL: str = Field(
+        default="https://opendata.economie.fgov.be/api",
+        description="Base URL for KBO API.",
+    )
+
+    # ------------------------------------------------------------------
     # Admin registration
     # ------------------------------------------------------------------
     ADMIN_INVITE_CODE: str = Field(

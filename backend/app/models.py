@@ -103,6 +103,25 @@ class WebhookEventStatus(str, enum.Enum):
     DUPLICATE = "duplicate"
 
 
+class UserStatus(str, enum.Enum):
+    PENDING = "pending"
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+
+
+class PlanType(str, enum.Enum):
+    CREDITS = "credits"
+    SUBSCRIPTION = "subscription"
+
+
+class SubscriptionStatus(str, enum.Enum):
+    ACTIVE = "active"
+    PAST_DUE = "past_due"
+    CANCELED = "canceled"
+    INCOMPLETE = "incomplete"
+
+
 # ---------------------------------------------------------------------------
 # Core MVP tables
 # ---------------------------------------------------------------------------
@@ -168,9 +187,39 @@ class User(Base):
         Enum(UserRole, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
         nullable=False, default=UserRole.USER, server_default='user'
     )
+    status: Mapped[UserStatus] = mapped_column(
+        Enum(UserStatus, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False, default=UserStatus.PENDING, server_default='pending'
+    )
     password_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Auth token for API access; stored as raw token for demo simplicity
     auth_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # Company profile (enriched via KVK/KBO or manual entry)
+    company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    legal_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    address_street: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    address_postal_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    address_city: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    address_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    vat_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    kvk_number: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    kbo_number: Mapped[str | None] = mapped_column(String(12), nullable=True)
+
+    # Registry enrichment tracking
+    enrichment_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    enrichment_last_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, server_default='never_fetched')
+    enrichment_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Privacy consent for registry enrichment
+    consent_registry_enrichment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default='false')
+    consent_registry_enrichment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Admin notes
+    admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -644,6 +693,9 @@ class RegistrationToken(Base):
         nullable=False,
     )
     intake_phone_number_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    token_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default='registration'
+    )  # registration | activation | renewal
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -655,7 +707,133 @@ class RegistrationToken(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<RegistrationToken phone={self.phone_number!r}>"
+        return f"<RegistrationToken phone={self.phone_number!r} type={self.token_type!r}>"
+
+
+# ---------------------------------------------------------------------------
+# Billing tables
+# ---------------------------------------------------------------------------
+
+
+class BillingPlan(Base):
+    """Billing plan definitions (seeded, rarely changed)."""
+
+    __tablename__ = "billing_plans"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    code: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    plan_type: Mapped[PlanType] = mapped_column(
+        Enum(PlanType, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False,
+    )
+    credits_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stripe_product_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    stripe_price_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<BillingPlan code={self.code!r} type={self.plan_type!r}>"
+
+
+class UserSubscription(Base):
+    """Tracks a user's active billing subscription or one-time purchase."""
+
+    __tablename__ = "user_subscriptions"
+    __table_args__ = (
+        Index("ix_user_sub_user_id", "user_id"),
+        Index("ix_user_sub_stripe_customer_id", "stripe_customer_id"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    stripe_customer_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[SubscriptionStatus] = mapped_column(
+        Enum(SubscriptionStatus, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False, default=SubscriptionStatus.ACTIVE,
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped[User] = relationship("User")
+    tenant: Mapped[Tenant] = relationship("Tenant")
+
+    def __repr__(self) -> str:
+        return f"<UserSubscription user={self.user_id!r} plan={self.plan_code!r}>"
+
+
+class UserCreditsLedger(Base):
+    """Append-only ledger for credits tracking. SUM(delta) = remaining credits."""
+
+    __tablename__ = "user_credits_ledger"
+    __table_args__ = (
+        Index("ix_credits_user_id", "user_id"),
+        Index("ix_credits_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    invoice_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserCreditsLedger user={self.user_id!r} delta={self.delta!r}>"
+
+
+class RegistryEnrichmentEvent(Base):
+    """Audit trail for KVK/KBO registry lookups."""
+
+    __tablename__ = "registry_enrichment_events"
+    __table_args__ = (
+        Index("ix_enrichment_user_id", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    registry_type: Mapped[str] = mapped_column(String(10), nullable=False)  # KVK or KBO
+    identifier: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_by_admin_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id"), nullable=False
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    response_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    applied_fields_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<RegistryEnrichmentEvent user={self.user_id!r} type={self.registry_type!r}>"
 
 
 # ---------------------------------------------------------------------------

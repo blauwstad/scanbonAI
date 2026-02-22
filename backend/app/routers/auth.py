@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from itsdangerous import BadData, SignatureExpired, URLSafeTimedSerializer
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,8 +104,7 @@ async def request_magic_link(
     # Resolve tenant
     tenant_result = await db.execute(
         select(Tenant).where(
-            Tenant.slug == body.tenant_slug,
-            Tenant.is_active.is_(True),
+            Tenant.name == body.tenant_slug,
         )
     )
     tenant: Tenant | None = tenant_result.scalars().first()
@@ -117,9 +117,8 @@ async def request_magic_link(
     # Resolve or create user
     user_result = await db.execute(
         select(User).where(
-            User.phone_number == body.phone_number,
+            User.whatsapp_phone == body.phone_number,
             User.tenant_id == tenant.id,
-            User.is_active.is_(True),
         )
     )
     user: User | None = user_result.scalars().first()
@@ -128,7 +127,7 @@ async def request_magic_link(
         # Auto-create user on first magic-link request
         user = User(
             tenant_id=tenant.id,
-            phone_number=body.phone_number,
+            whatsapp_phone=body.phone_number,
         )
         db.add(user)
         await db.flush()  # get the generated ID
@@ -220,7 +219,6 @@ async def verify_magic_link(
         select(User).where(
             User.id == user_id,
             User.tenant_id == tenant_id,
-            User.is_active.is_(True),
         )
     )
     user: User | None = result.scalars().first()
@@ -237,8 +235,7 @@ async def verify_magic_link(
         days=_SESSION_TTL_DAYS
     )
 
-    user.session_token_hash = _hash_token(raw_session_token)
-    user.session_expires_at = session_expires_at
+    user.auth_token = raw_session_token
 
     logger.info(
         "auth.session.created",
@@ -275,3 +272,61 @@ async def get_me(
     Uses the ``get_current_user`` dependency which validates the Bearer token.
     """
     return SuccessResponse(data=UserSchema.model_validate(current_user))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/demo-login  – bypass for demo purposes
+# ---------------------------------------------------------------------------
+
+
+class DemoLoginRequest(BaseModel):
+    role: str = "user"
+
+
+class DemoAuthResponse(BaseModel):
+    user: UserSchema
+    access_token: str
+    refresh_token: str
+    expires_at: str
+
+
+@router.post(
+    "/demo-login",
+    response_model=SuccessResponse[DemoAuthResponse],
+    summary="Demo login (no magic link required)",
+)
+async def demo_login(
+    body: DemoLoginRequest,
+    db: DBSession,
+) -> SuccessResponse[DemoAuthResponse]:
+    """
+    Instant login for demo purposes. Accepts ``role`` ("user" or "admin")
+    and returns the pre-seeded auth token so the frontend can authenticate
+    without a WhatsApp magic-link flow.
+    """
+    from datetime import timedelta
+
+    target_role = body.role if body.role in ("user", "admin") else "user"
+
+    from sqlalchemy import text as sa_text
+    result = await db.execute(
+        select(User).where(sa_text("role::text = :role")).params(role=target_role).limit(1)
+    )
+    user: User | None = result.scalars().first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No demo user with role '{target_role}' found. Run seed_demo first.",
+        )
+
+    expires = datetime.now(tz=timezone.utc) + timedelta(days=30)
+
+    return SuccessResponse(
+        data=DemoAuthResponse(
+            user=UserSchema.model_validate(user),
+            access_token=user.auth_token,
+            refresh_token=f"demo-refresh-{user.id[:8]}",
+            expires_at=expires.isoformat(),
+        )
+    )

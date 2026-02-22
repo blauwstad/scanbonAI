@@ -1,8 +1,7 @@
 import { useState, useCallback } from "react";
-import { Receipt, Mail } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Receipt, User, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -10,31 +9,32 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { authApi } from "@/api/client";
+import { useAuthStore } from "@/stores/auth-store";
+import apiClient from "@/api/client";
 import toast from "react-hot-toast";
 
 export function LoginPage() {
-  const [email, setEmail] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isLinkSent, setIsLinkSent] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState("");
+  const navigate = useNavigate();
+  const { setAuth } = useAuthStore();
 
-  const handleSubmit = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!email.trim()) return;
-
-      setIsSubmitting(true);
+  const handleDemoLogin = useCallback(
+    async (role: "user" | "admin") => {
+      setIsSubmitting(role);
       try {
-        await authApi.login({ email: email.trim() });
-        setIsLinkSent(true);
-        toast.success("Magic link sent! Check your email.");
+        const { data: res } = await apiClient.post("/auth/demo-login", { role });
+        const { user, access_token, refresh_token } = res.data;
+        localStorage.setItem("refresh_token", refresh_token);
+        setAuth(user, access_token);
+        toast.success(`Welcome, ${user.name}!`);
+        navigate(role === "admin" ? "/admin" : "/invoices", { replace: true });
       } catch {
-        toast.error("Failed to send login link. Please try again.");
+        toast.error("Demo login failed. Is the API running?");
       } finally {
-        setIsSubmitting(false);
+        setIsSubmitting("");
       }
     },
-    [email],
+    [setAuth, navigate],
   );
 
   return (
@@ -53,63 +53,50 @@ export function LoginPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Sign in</CardTitle>
+            <CardTitle>Demo Login</CardTitle>
             <CardDescription>
-              {isLinkSent
-                ? "Check your inbox for the magic link"
-                : "Enter your email to receive a magic link"}
+              Choose a role to explore the application
             </CardDescription>
           </CardHeader>
-          <CardContent>
-            {isLinkSent ? (
-              <div className="space-y-4 text-center">
-                <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-green-100">
-                  <Mail className="h-6 w-6 text-green-600" />
+          <CardContent className="space-y-3">
+            <Button
+              className="w-full justify-start gap-3 h-auto py-4"
+              variant="outline"
+              disabled={!!isSubmitting}
+              onClick={() => handleDemoLogin("user")}
+            >
+              <User className="h-5 w-5 text-blue-500 shrink-0" />
+              <div className="text-left">
+                <div className="font-medium">
+                  {isSubmitting === "user" ? "Logging in..." : "Jan de Vries (User)"}
                 </div>
-                <p className="text-sm text-muted-foreground">
-                  We sent a login link to{" "}
-                  <span className="font-medium text-foreground">{email}</span>.
-                  Click the link in the email to sign in.
-                </p>
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setIsLinkSent(false);
-                    setEmail("");
-                  }}
-                >
-                  Use a different email
-                </Button>
+                <div className="text-xs text-muted-foreground">
+                  View invoices, submit corrections, confirm extractions
+                </div>
               </div>
-            ) : (
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="email">Email address</Label>
-                  <Input
-                    id="email"
-                    type="email"
-                    placeholder="you@company.com"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    required
-                    autoFocus
-                  />
+            </Button>
+
+            <Button
+              className="w-full justify-start gap-3 h-auto py-4"
+              variant="outline"
+              disabled={!!isSubmitting}
+              onClick={() => handleDemoLogin("admin")}
+            >
+              <Shield className="h-5 w-5 text-amber-500 shrink-0" />
+              <div className="text-left">
+                <div className="font-medium">
+                  {isSubmitting === "admin" ? "Logging in..." : "Admin Demo (Admin)"}
                 </div>
-                <Button
-                  type="submit"
-                  className="w-full"
-                  disabled={isSubmitting || !email.trim()}
-                >
-                  {isSubmitting ? "Sending..." : "Send Magic Link"}
-                </Button>
-              </form>
-            )}
+                <div className="text-xs text-muted-foreground">
+                  Review all invoices, approve/reject, view metrics, export
+                </div>
+              </div>
+            </Button>
           </CardContent>
         </Card>
 
         <p className="mt-6 text-center text-xs text-muted-foreground">
-          Simply send your invoice photos to our WhatsApp number and manage them
-          here.
+          Demo environment with 6 sample invoices from Dutch suppliers.
         </p>
       </div>
     </div>

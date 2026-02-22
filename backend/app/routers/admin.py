@@ -24,7 +24,6 @@ import csv
 import io
 import json
 import math
-from datetime import datetime, timezone
 from typing import Annotated, Any
 
 import structlog
@@ -36,7 +35,7 @@ from sqlalchemy.orm import selectinload
 
 from app.dependencies import AdminUser, DBSession, require_admin
 from app.models import (
-    AdminDecision,
+    AdminReviewAction,
     AdminReview,
     ExtractedData,
     Invoice,
@@ -125,7 +124,7 @@ async def admin_list_invoices(
     if user_id:
         base_query = base_query.where(Invoice.user_id == user_id)
     if month:
-        base_query = base_query.where(Invoice.month == month)
+        base_query = base_query.where(Invoice.month_partition == month)
     if invoice_status:
         base_query = base_query.where(Invoice.status == invoice_status)
 
@@ -212,22 +211,17 @@ async def admin_review_invoice(
     )
 
     # Validate state transition: only invoices pending admin review can be reviewed
-    if invoice.status not in (
-        InvoiceStatus.USER_CONFIRMED,
-        InvoiceStatus.USER_CORRECTED,
-        InvoiceStatus.ADMIN_REVIEW_PENDING,
-    ):
+    if invoice.status != InvoiceStatus.REVIEWED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Invoice in status {invoice.status!r} cannot be reviewed. "
-                "It must be in 'user_confirmed', 'user_corrected', or "
-                "'admin_review_pending'."
+                "It must be in 'reviewed' status."
             ),
         )
 
     # Validate override_data presence when decision is OVERRIDDEN
-    if body.decision == AdminDecision.OVERRIDDEN and not body.override_data:
+    if body.action == AdminReviewAction.OVERRIDDEN and not body.override_data:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="override_data is required when decision is 'overridden'.",
@@ -240,40 +234,39 @@ async def admin_review_invoice(
     existing: AdminReview | None = existing_result.scalars().first()
 
     if existing:
-        existing.decision = body.decision
-        existing.override_data = body.override_data
+        existing.action = body.action
+        existing.override_json = body.override_data
         existing.notes = body.notes
-        existing.reviewed_by = admin_user.id
-        existing.reviewed_at = datetime.now(tz=timezone.utc)
+        existing.reviewer_id = admin_user.id
     else:
         review = AdminReview(
             invoice_id=invoice_id,
-            reviewed_by=admin_user.id,
-            decision=body.decision,
-            override_data=body.override_data,
+            reviewer_id=admin_user.id,
+            action=body.action,
+            override_json=body.override_data,
             notes=body.notes,
         )
         db.add(review)
 
     # Update invoice status
     new_status_map = {
-        AdminDecision.APPROVED: InvoiceStatus.APPROVED,
-        AdminDecision.OVERRIDDEN: InvoiceStatus.APPROVED,
-        AdminDecision.REJECTED: InvoiceStatus.REJECTED,
+        AdminReviewAction.APPROVED: InvoiceStatus.APPROVED,
+        AdminReviewAction.OVERRIDDEN: InvoiceStatus.APPROVED,
+        AdminReviewAction.FLAGGED: InvoiceStatus.REVIEWED,
     }
-    invoice.status = new_status_map[body.decision]
+    invoice.status = new_status_map[body.action]
 
     logger.info(
         "admin.review.submitted",
         invoice_id=invoice_id,
         admin_id=admin_user.id,
-        decision=body.decision.value,
+        decision=body.action.value,
     )
 
     return SuccessResponse(
         data={
             "invoice_id": invoice_id,
-            "decision": body.decision.value,
+            "decision": body.action.value,
             "new_status": invoice.status.value,
         }
     )
@@ -301,7 +294,7 @@ async def admin_metrics(
     """
     base_filter = [Invoice.tenant_id == admin_user.tenant_id]
     if month:
-        base_filter.append(Invoice.month == month)
+        base_filter.append(Invoice.month_partition == month)
 
     # Total invoices
     total_result = await db.execute(
@@ -319,15 +312,9 @@ async def admin_metrics(
         row[0].value: row[1] for row in status_result.all()
     }
 
-    # Average confidence
-    conf_result = await db.execute(
-        select(func.avg(ExtractedData.overall_confidence)).where(
-            ExtractedData.invoice_id.in_(
-                select(Invoice.id).where(*base_filter)
-            )
-        )
-    )
-    avg_confidence: float | None = conf_result.scalar_one()
+    # Average confidence – confidence data lives in JSONB (confidence_scores);
+    # computing an average across JSONB is non-trivial, so we skip it here.
+    avg_confidence: float | None = None
 
     # Correction count
     corrections_result = await db.execute(
@@ -341,7 +328,7 @@ async def admin_metrics(
 
     # Approval / rejection counts
     approvals = invoices_by_status.get(InvoiceStatus.APPROVED.value, 0)
-    rejections = invoices_by_status.get(InvoiceStatus.REJECTED.value, 0)
+    rejections = 0  # No REJECTED status exists; flagged items stay in REVIEWED
 
     return SuccessResponse(
         data=MetricsResponse(
@@ -378,7 +365,7 @@ async def admin_export(
     """
     base_filter = [Invoice.tenant_id == admin_user.tenant_id]
     if month:
-        base_filter.append(Invoice.month == month)
+        base_filter.append(Invoice.month_partition == month)
     if invoice_status:
         base_filter.append(Invoice.status == invoice_status)
 
@@ -430,32 +417,17 @@ def _build_admin_detail_schema(invoice: Invoice) -> AdminInvoiceDetailSchema:
 
     base = _build_detail_schema(invoice)
 
-    # Build extraction vs. correction diff
+    # Build extraction vs. correction diff from the correction's diff_json
     ext_vs_corr: dict[str, Any] = {}
-    if invoice.extracted_data and invoice.corrections:
-        ed = invoice.extracted_data
+    if invoice.corrections:
         for corr in invoice.corrections:
-            extracted_val = getattr(ed, corr.field_name, None)
-            ext_vs_corr[corr.field_name] = {
-                "extracted": extracted_val,
-                "corrected": corr.corrected_value,
-                "changed": str(extracted_val) != str(corr.corrected_value),
-            }
+            if corr.diff_json:
+                ext_vs_corr.update(corr.diff_json)
 
-    # Build correction vs. admin override diff
+    # Build correction vs. admin override diff from admin_review's override_json
     corr_vs_admin: dict[str, Any] = {}
-    if invoice.admin_review and invoice.admin_review.override_data:
-        correction_map = {
-            corr.field_name: corr.corrected_value
-            for corr in (invoice.corrections or [])
-        }
-        for field_name, override_val in invoice.admin_review.override_data.items():
-            corr_val = correction_map.get(field_name)
-            corr_vs_admin[field_name] = {
-                "corrected": corr_val,
-                "admin_override": override_val,
-                "changed": str(corr_val) != str(override_val),
-            }
+    if invoice.admin_review and invoice.admin_review.override_json:
+        corr_vs_admin = invoice.admin_review.override_json
 
     return AdminInvoiceDetailSchema(
         **base.model_dump(),
@@ -467,19 +439,19 @@ def _build_admin_detail_schema(invoice: Invoice) -> AdminInvoiceDetailSchema:
 def _invoice_to_export_row(invoice: Invoice) -> dict[str, Any]:
     """Flatten an invoice + extracted data into a dict row for CSV/JSON export."""
     ed: ExtractedData | None = invoice.extracted_data
+    extracted: dict[str, Any] = (ed.extracted_json or {}) if ed else {}
     return {
         "invoice_id": invoice.id,
         "user_id": invoice.user_id,
         "tenant_id": invoice.tenant_id,
         "status": invoice.status.value,
-        "month": invoice.month,
+        "month_partition": invoice.month_partition,
         "created_at": invoice.created_at.isoformat(),
-        "vendor_name": ed.vendor_name if ed else None,
-        "vendor_tax_id": ed.vendor_tax_id if ed else None,
-        "invoice_number": ed.invoice_number if ed else None,
-        "invoice_date": ed.invoice_date if ed else None,
-        "total_amount": ed.total_amount if ed else None,
-        "tax_amount": ed.tax_amount if ed else None,
-        "currency": ed.currency if ed else None,
-        "overall_confidence": ed.overall_confidence if ed else None,
+        "vendor_name": extracted.get("vendor_name"),
+        "vendor_tax_id": extracted.get("vendor_tax_id"),
+        "invoice_number": extracted.get("invoice_number"),
+        "invoice_date": extracted.get("invoice_date"),
+        "total_amount": extracted.get("total_amount"),
+        "tax_amount": extracted.get("tax_amount"),
+        "currency": extracted.get("currency"),
     }

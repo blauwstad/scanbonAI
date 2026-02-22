@@ -14,9 +14,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.models import AdminDecision, InvoiceStatus, SignedLinkType
+from app.models import AdminReviewAction, InvoiceStatus, SignedLinkType
 
 # ---------------------------------------------------------------------------
 # Generic response wrapper
@@ -51,6 +51,14 @@ class PaginatedResponse(BaseModel, Generic[T]):
     page: int
     page_size: int
     pages: int
+    total_pages: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_pages(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data.setdefault("total_pages", data.get("pages", 0))
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +73,6 @@ class TenantSchema(BaseModel):
 
     id: str
     name: str
-    slug: str
-    is_active: bool
     created_at: datetime
 
 
@@ -76,50 +82,62 @@ class TenantSchema(BaseModel):
 
 
 class UserSchema(BaseModel):
-    """Public representation of a User (no session token)."""
+    """Public representation of a User.
+
+    Maps ORM fields to frontend-expected names:
+    display_name → name, whatsapp_phone → phone, derived email.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     tenant_id: str
-    phone_number: str
-    display_name: str | None
-    is_active: bool
-    is_admin: bool
+    name: str | None = None
+    email: str = ""
+    phone: str | None = None
+    role: str = "user"
+    is_active: bool = True
     created_at: datetime
+    last_login_at: datetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_orm_fields(cls, data: Any) -> Any:
+        if hasattr(data, "__dict__"):
+            d = {k: v for k, v in data.__dict__.items() if not k.startswith("_")}
+        elif isinstance(data, dict):
+            d = dict(data)
+        else:
+            return data
+        if "display_name" in d and "name" not in d:
+            d["name"] = d.pop("display_name")
+        if "whatsapp_phone" in d and "phone" not in d:
+            d["phone"] = d.pop("whatsapp_phone")
+        if "email" not in d or not d.get("email"):
+            name = d.get("name") or "user"
+            d["email"] = f"{name.lower().replace(' ', '.')}@scanbon.ai"
+        d.setdefault("is_active", True)
+        return d
 
 
 # ---------------------------------------------------------------------------
-# Invoice field confidence
+# Extracted data
 # ---------------------------------------------------------------------------
-
-
-class FieldWithConfidence(BaseModel):
-    """A single extracted invoice field with its confidence score."""
-
-    value: str | None
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class InvoiceMetadataSchema(BaseModel):
     """
-    Structured extraction result exposed to the API.
+    Extraction result exposed to the API.
 
-    Every field carries an individual confidence score so the frontend
-    can highlight cells that are likely to need user correction.
+    ExtractedData stores results as JSONB blobs (extracted_json and
+    confidence_scores), so this schema exposes them as raw dicts.
     """
 
     model_config = ConfigDict(from_attributes=True)
 
-    vendor_name: FieldWithConfidence
-    vendor_tax_id: FieldWithConfidence
-    invoice_number: FieldWithConfidence
-    invoice_date: FieldWithConfidence
-    total_amount: FieldWithConfidence
-    tax_amount: FieldWithConfidence
-    currency: FieldWithConfidence
-    line_items: list[dict[str, Any]] | None = None
-    overall_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    extracted_json: dict[str, Any]
+    confidence_scores: dict[str, Any]
+    extraction_version: str
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +153,7 @@ class QualityCheckSchema(BaseModel):
     blur_score: float | None
     resolution_ok: bool | None
     skew_angle: float | None
-    passed: bool
+    overall_pass: bool
     failure_reasons: list[str] | None
 
 
@@ -153,8 +171,7 @@ class InvoiceListItemSchema(BaseModel):
     tenant_id: str
     user_id: str
     status: InvoiceStatus
-    month: str | None
-    original_filename: str | None
+    month_partition: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -174,32 +191,27 @@ class InvoiceDetailSchema(InvoiceListItemSchema):
 
 
 class CorrectionSchema(BaseModel):
-    """A single user-submitted field correction (read model)."""
+    """A user-submitted correction record (read model)."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    field_name: str
-    original_value: str | None
-    corrected_value: str | None
+    invoice_id: str
+    extracted_data_id: str
+    corrected_json: dict[str, Any]
+    diff_json: dict[str, Any]
+    corrected_by_user_id: str
     created_at: datetime
 
 
 class CorrectionRequest(BaseModel):
     """Payload for PUT /api/v1/invoices/{id}/corrections."""
 
-    corrections: list[FieldCorrectionItem] = Field(
-        ..., min_length=1, description="List of field corrections to apply."
+    corrected_json: dict[str, Any] = Field(
+        ..., description="Full corrected extraction data as a JSON object."
     )
-
-
-class FieldCorrectionItem(BaseModel):
-    """One field–value pair in a correction request."""
-
-    field_name: str = Field(..., min_length=1, max_length=100)
-    corrected_value: str | None = Field(
-        default=None,
-        description="NULL means the field should be cleared.",
+    diff_json: dict[str, Any] = Field(
+        ..., description="Diff between original and corrected data as a JSON object."
     )
 
 
@@ -214,21 +226,23 @@ class AdminReviewSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    decision: AdminDecision
-    override_data: dict[str, Any] | None
+    invoice_id: str
+    reviewer_id: str
+    action: AdminReviewAction
+    override_json: dict[str, Any] | None
     notes: str | None
-    reviewed_at: datetime
+    created_at: datetime
 
 
 class AdminReviewRequest(BaseModel):
     """Payload for POST /api/v1/admin/invoices/{id}/review."""
 
-    decision: AdminDecision
-    override_data: dict[str, Any] | None = Field(
+    action: AdminReviewAction
+    override_json: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Field overrides when decision is OVERRIDDEN. "
-            "Keys must match ExtractedData field names."
+            "Field overrides when action is OVERRIDDEN. "
+            "Keys must match ExtractedData extracted_json keys."
         ),
     )
     notes: str | None = Field(default=None, max_length=2000)

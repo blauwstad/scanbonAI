@@ -75,21 +75,18 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db_session),
 ) -> User:
     """
-    Resolve the authenticated user from the Bearer session token.
+    Resolve the authenticated user from the Bearer token.
 
-    The token is the raw magic-link session token.  We hash it and compare
-    against ``users.session_token_hash`` to avoid storing plain tokens.
+    The token is compared directly against ``users.auth_token``
+    (stored as raw token for demo simplicity).
 
     Raises ``401 Unauthorized`` if:
     - No Authorization header is present.
-    - The token does not match any active session.
-    - The session has expired.
+    - The token does not match any user.
 
     Sets ``request.state.tenant_id`` from the resolved user so that
     ``TenantIsolationMiddleware`` has the correct value for log context.
     """
-    from datetime import datetime, timezone  # local import to avoid circular
-
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -97,12 +94,9 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token_hash = _hash_token(credentials.credentials)
-
     result = await db.execute(
         select(User).where(
-            User.session_token_hash == token_hash,
-            User.is_active.is_(True),
+            User.auth_token == credentials.credentials,
         )
     )
     user: User | None = result.scalars().first()
@@ -111,14 +105,6 @@ async def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired session token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    now = datetime.now(tz=timezone.utc)
-    if user.session_expires_at is not None and user.session_expires_at < now:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has expired. Please request a new magic link.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -152,7 +138,7 @@ async def require_admin(
         async def list_all(admin: User = Depends(require_admin)) -> ...:
             ...
     """
-    if not current_user.is_admin:
+    if current_user.role != "admin":
         logger.warning(
             "admin_access_denied",
             user_id=current_user.id,
@@ -176,7 +162,7 @@ async def require_tenant_access(
     """
     Validate that:
     1. The current user's ``tenant_id`` matches the tenant in ``request.state``.
-    2. The tenant record exists and is active.
+    2. The tenant record exists.
 
     This dependency performs a single DB lookup per request and is the
     canonical place to enforce tenant isolation at the API layer.
@@ -188,7 +174,6 @@ async def require_tenant_access(
     result = await db.execute(
         select(Tenant).where(
             Tenant.id == tenant_id,
-            Tenant.is_active.is_(True),
         )
     )
     tenant: Tenant | None = result.scalars().first()

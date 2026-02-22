@@ -51,6 +51,7 @@ router = APIRouter(prefix="/api/v1/signed", tags=["signed-links"])
 @router.get(
     "/{token}",
     summary="Resolve a signed link",
+    response_model=None,
 )
 async def resolve_signed_link(
     token: str,
@@ -151,14 +152,14 @@ async def resolve_signed_link(
 
 async def _serve_image(invoice: Invoice, log: Any) -> FileResponse:
     """Stream the raw invoice image file."""
-    if invoice.storage_path is None:
+    if invoice.file_path is None:
         log.warning("signed_link.image_no_path")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Image is not yet available.",
         )
 
-    abs_path = resolve_abs_path(invoice.storage_path)
+    abs_path = resolve_abs_path(invoice.file_path)
     if not Path(abs_path).exists():
         log.error("signed_link.image_file_missing", path=abs_path)
         raise HTTPException(
@@ -168,8 +169,8 @@ async def _serve_image(invoice: Invoice, log: Any) -> FileResponse:
 
     return FileResponse(
         path=abs_path,
-        media_type=invoice.mime_type or "image/jpeg",
-        filename=invoice.original_filename or f"invoice-{invoice.id}.jpg",
+        media_type="image/jpeg",
+        filename=f"invoice-{invoice.id}.jpg",
     )
 
 
@@ -195,8 +196,8 @@ async def _handle_confirm(
     log: Any,
 ) -> SuccessResponse[SignedLinkResolveResponse]:
     """Auto-confirm the invoice if it is awaiting review."""
-    if invoice.status == InvoiceStatus.AWAITING_USER_REVIEW:
-        invoice.status = InvoiceStatus.USER_CONFIRMED
+    if invoice.status == InvoiceStatus.EXTRACTED:
+        invoice.status = InvoiceStatus.REVIEWED
         log.info("signed_link.confirm.accepted")
     else:
         log.info(

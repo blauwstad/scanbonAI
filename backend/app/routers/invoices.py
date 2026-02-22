@@ -124,7 +124,7 @@ async def list_invoices(
     )
 
     if month:
-        base_query = base_query.where(Invoice.month == month)
+        base_query = base_query.where(Invoice.month_partition == month)
     if invoice_status:
         base_query = base_query.where(Invoice.status == invoice_status)
 
@@ -214,7 +214,7 @@ async def get_invoice_image_url(
         invoice_id, current_user.id, current_user.tenant_id, db
     )
 
-    if invoice.storage_path is None:
+    if invoice.file_path is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Image is not yet available for this invoice.",
@@ -280,30 +280,15 @@ async def submit_corrections(
     current_user: CurrentUser,
 ) -> SuccessResponse[dict[str, Any]]:
     """
-    Submit user corrections for extracted invoice fields.
+    Submit user corrections for extracted invoice data.
 
-    The endpoint accepts a list of ``{field_name, corrected_value}`` pairs.
-    Each pair is stored as a ``UserCorrection`` row with the original
-    extracted value snapshotted at write time.
+    The endpoint accepts a JSON body with ``corrected_json`` (the full
+    corrected extraction) and ``diff_json`` (a diff of what changed).
+    A single ``UserCorrection`` record is created linking to the
+    ``ExtractedData`` row.
 
-    The invoice status is updated to ``USER_CORRECTED`` after the write.
-
-    Allowed fields
-    --------------
-    Only fields that exist on ``ExtractedData`` can be corrected:
-    vendor_name, vendor_tax_id, invoice_number, invoice_date,
-    total_amount, tax_amount, currency.
+    The invoice status is updated to ``REVIEWED`` after the write.
     """
-    _CORRECTABLE_FIELDS = {
-        "vendor_name",
-        "vendor_tax_id",
-        "invoice_number",
-        "invoice_date",
-        "total_amount",
-        "tax_amount",
-        "currency",
-    }
-
     invoice = await _get_invoice_or_404(
         invoice_id,
         current_user.id,
@@ -312,61 +297,44 @@ async def submit_corrections(
         load_relations=True,
     )
 
-    # Only invoices awaiting review can be corrected
-    if invoice.status not in (
-        InvoiceStatus.AWAITING_USER_REVIEW,
-        InvoiceStatus.USER_CORRECTED,
-    ):
+    # Only invoices with extracted data can be corrected
+    if invoice.status != InvoiceStatus.EXTRACTED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Invoice in status {invoice.status!r} cannot accept corrections. "
-                "It must be in 'awaiting_user_review' or 'user_corrected'."
+                "It must be in 'extracted'."
             ),
         )
 
-    # Validate field names
-    invalid_fields = {
-        item.field_name
-        for item in body.corrections
-        if item.field_name not in _CORRECTABLE_FIELDS
-    }
-    if invalid_fields:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unknown correctable fields: {sorted(invalid_fields)}",
-        )
-
-    # Retrieve current extracted values for snapshotting
     extracted: ExtractedData | None = invoice.extracted_data
-
-    created_corrections: list[str] = []
-    for item in body.corrections:
-        original = getattr(extracted, item.field_name, None) if extracted else None
-        correction = UserCorrection(
-            invoice_id=invoice_id,
-            user_id=current_user.id,
-            field_name=item.field_name,
-            original_value=str(original) if original is not None else None,
-            corrected_value=item.corrected_value,
+    if extracted is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No extracted data available for this invoice.",
         )
-        db.add(correction)
-        created_corrections.append(item.field_name)
 
-    invoice.status = InvoiceStatus.USER_CORRECTED
+    correction = UserCorrection(
+        invoice_id=invoice_id,
+        extracted_data_id=extracted.id,
+        corrected_json=body.corrected_json,
+        diff_json=body.diff_json,
+        corrected_by_user_id=current_user.id,
+    )
+    db.add(correction)
+
+    invoice.status = InvoiceStatus.REVIEWED
 
     logger.info(
         "invoice.corrections.submitted",
         invoice_id=invoice_id,
         user_id=current_user.id,
-        fields=created_corrections,
     )
 
     return SuccessResponse(
         data={
             "invoice_id": invoice_id,
-            "corrections_applied": created_corrections,
-            "new_status": InvoiceStatus.USER_CORRECTED.value,
+            "new_status": InvoiceStatus.REVIEWED.value,
         }
     )
 
@@ -399,16 +367,16 @@ async def confirm_invoice(
         invoice_id, current_user.id, current_user.tenant_id, db
     )
 
-    if invoice.status != InvoiceStatus.AWAITING_USER_REVIEW:
+    if invoice.status != InvoiceStatus.EXTRACTED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Invoice in status {invoice.status!r} cannot be confirmed. "
-                "It must be in 'awaiting_user_review'."
+                "It must be in 'extracted'."
             ),
         )
 
-    invoice.status = InvoiceStatus.USER_CONFIRMED
+    invoice.status = InvoiceStatus.REVIEWED
 
     logger.info(
         "invoice.confirmed",
@@ -419,7 +387,7 @@ async def confirm_invoice(
     return SuccessResponse(
         data={
             "invoice_id": invoice_id,
-            "new_status": InvoiceStatus.USER_CONFIRMED.value,
+            "new_status": InvoiceStatus.REVIEWED.value,
         }
     )
 
@@ -436,29 +404,15 @@ def _build_detail_schema(invoice: Invoice) -> InvoiceDetailSchema:
     extracted_schema: InvoiceMetadataSchema | None = None
     if invoice.extracted_data:
         ed = invoice.extracted_data
-        fc: dict[str, Any] = ed.field_confidence or {}
-
-        def _fwc(field_name: str) -> dict[str, Any]:
-            return {
-                "value": getattr(ed, field_name, None),
-                "confidence": fc.get(field_name),
-            }
-
         extracted_schema = InvoiceMetadataSchema(
-            vendor_name=_fwc("vendor_name"),
-            vendor_tax_id=_fwc("vendor_tax_id"),
-            invoice_number=_fwc("invoice_number"),
-            invoice_date=_fwc("invoice_date"),
-            total_amount=_fwc("total_amount"),
-            tax_amount=_fwc("tax_amount"),
-            currency=_fwc("currency"),
-            line_items=ed.line_items,
-            overall_confidence=ed.overall_confidence,
+            extracted_json=ed.extracted_json or {},
+            confidence_scores=ed.confidence_scores or {},
+            extraction_version=ed.extraction_version,
         )
 
     return InvoiceDetailSchema.model_validate(
         {
-            **invoice.__dict__,
+            **{k: v for k, v in invoice.__dict__.items() if not k.startswith('_')},
             "extracted_data": extracted_schema,
         }
     )

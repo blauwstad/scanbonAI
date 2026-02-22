@@ -32,7 +32,6 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -40,7 +39,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -70,24 +68,19 @@ def _now() -> datetime:
 
 
 class InvoiceStatus(str, enum.Enum):
-    RECEIVED = "received"
+    UPLOADED = "uploaded"
     QUALITY_FAILED = "quality_failed"
-    OCR_PENDING = "ocr_pending"
-    OCR_FAILED = "ocr_failed"
-    EXTRACTION_PENDING = "extraction_pending"
-    AWAITING_USER_REVIEW = "awaiting_user_review"
-    USER_CONFIRMED = "user_confirmed"
-    USER_CORRECTED = "user_corrected"
-    ADMIN_REVIEW_PENDING = "admin_review_pending"
+    PROCESSING = "processing"
+    EXTRACTED = "extracted"
+    REVIEWED = "reviewed"
     APPROVED = "approved"
-    REJECTED = "rejected"
-    ARCHIVED = "archived"
+    EXPORTED = "exported"
 
 
-class AdminDecision(str, enum.Enum):
+class AdminReviewAction(str, enum.Enum):
     APPROVED = "approved"
     OVERRIDDEN = "overridden"
-    REJECTED = "rejected"
+    FLAGGED = "flagged"
 
 
 class SignedLinkType(str, enum.Enum):
@@ -113,8 +106,7 @@ class Tenant(Base):
     """
     Top-level isolation boundary.
 
-    Every other entity belongs to exactly one Tenant.  Tenant slugs are
-    used in storage paths and log context so they must be URL-safe.
+    Every other entity belongs to exactly one Tenant.
     """
 
     __tablename__ = "tenants"
@@ -123,8 +115,6 @@ class Tenant(Base):
         UUID(as_uuid=False), primary_key=True, default=_uuid
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -135,28 +125,28 @@ class Tenant(Base):
         nullable=False,
     )
     # settings stored as flexible JSON (e.g. OCR language hints, tax authority config)
-    settings: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    settings_json: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default='{}')
 
     # Relationships
     users: Mapped[list[User]] = relationship("User", back_populates="tenant")
     invoices: Mapped[list[Invoice]] = relationship("Invoice", back_populates="tenant")
 
     def __repr__(self) -> str:
-        return f"<Tenant id={self.id!r} slug={self.slug!r}>"
+        return f"<Tenant id={self.id!r} name={self.name!r}>"
 
 
 class User(Base):
     """
     A WhatsApp end-user who sends invoice images.
 
-    ``phone_number`` is the WhatsApp E.164 number and acts as the natural key
+    ``whatsapp_phone`` is the WhatsApp E.164 number and acts as the natural key
     within a tenant (the same phone may exist across tenants for multi-org
     scenarios, but the composite unique constraint prevents collisions).
     """
 
     __tablename__ = "users"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "phone_number", name="uq_user_tenant_phone"),
+        UniqueConstraint("tenant_id", "whatsapp_phone", name="uq_users_tenant_phone"),
         Index("ix_user_tenant_id", "tenant_id"),
     )
 
@@ -166,15 +156,11 @@ class User(Base):
     tenant_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
-    phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    whatsapp_phone: Mapped[str] = mapped_column(String(20), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # Magic-link session token (hashed); NULL when no active session
-    session_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    session_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    role: Mapped[str] = mapped_column(String, nullable=False, server_default='user')
+    # Auth token for API access; stored as raw token for demo simplicity
+    auth_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -193,22 +179,22 @@ class User(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<User id={self.id!r} phone={self.phone_number!r}>"
+        return f"<User id={self.id!r} phone={self.whatsapp_phone!r}>"
 
 
 class Invoice(Base):
     """
     Central record linking an image to its full processing lifecycle.
 
-    ``storage_path`` is the relative path under ``settings.STORAGE_PATH``.
-    The month field (YYYY-MM) enables fast filtering for monthly tax reports.
+    ``file_path`` is the path to the stored invoice image.
+    The month_partition field (YYYY-MM) enables fast filtering for monthly tax reports.
     """
 
     __tablename__ = "invoices"
     __table_args__ = (
         Index("ix_invoice_tenant_id", "tenant_id"),
         Index("ix_invoice_user_id", "user_id"),
-        Index("ix_invoice_month", "month"),
+        Index("ix_invoice_month_partition", "month_partition"),
         Index("ix_invoice_status", "status"),
     )
 
@@ -221,17 +207,18 @@ class Invoice(Base):
     user_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    # WhatsApp media id that was used to download the original image
-    whatsapp_media_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    storage_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    original_filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # YYYY-MM extracted from the invoice date (or upload date as fallback)
-    month: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[InvoiceStatus] = mapped_column(
-        Enum(InvoiceStatus), nullable=False, default=InvoiceStatus.RECEIVED
+        Enum(InvoiceStatus, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False, default=InvoiceStatus.UPLOADED
     )
+    upload_source: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default="whatsapp"
+    )
+    whatsapp_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # YYYY-MM partition key for monthly tax reports
+    month_partition: Mapped[str] = mapped_column(String(7), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -285,9 +272,11 @@ class QualityCheck(Base):
     blur_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     resolution_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     skew_angle: Mapped[float | None] = mapped_column(Float, nullable=True)
-    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    shadow_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exposure_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overall_pass: Mapped[bool] = mapped_column(Boolean, nullable=False)
     failure_reasons: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
+    checked_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
@@ -295,7 +284,7 @@ class QualityCheck(Base):
     invoice: Mapped[Invoice] = relationship("Invoice", back_populates="quality_check")
 
     def __repr__(self) -> str:
-        return f"<QualityCheck invoice={self.invoice_id!r} passed={self.passed!r}>"
+        return f"<QualityCheck invoice={self.invoice_id!r} overall_pass={self.overall_pass!r}>"
 
 
 class OCRResult(Base):
@@ -312,12 +301,10 @@ class OCRResult(Base):
         nullable=False,
         unique=True,
     )
-    engine: Mapped[str] = mapped_column(String(100), nullable=False)  # e.g. "deepseek_v2"
-    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Full engine response payload for debugging / re-processing
-    raw_response: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    processing_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    processing_time_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -326,15 +313,15 @@ class OCRResult(Base):
     invoice: Mapped[Invoice] = relationship("Invoice", back_populates="ocr_result")
 
     def __repr__(self) -> str:
-        return f"<OCRResult invoice={self.invoice_id!r} engine={self.engine!r}>"
+        return f"<OCRResult invoice={self.invoice_id!r} model={self.model_name!r}>"
 
 
 class ExtractedData(Base):
     """
     Structured invoice fields extracted from OCR text via LLM prompt.
 
-    Each field carries its own ``confidence`` score so the UI can highlight
-    low-confidence cells for user correction.
+    All extracted fields are stored as a single JSONB document with
+    per-field confidence scores.
     """
 
     __tablename__ = "extracted_data"
@@ -348,25 +335,21 @@ class ExtractedData(Base):
         nullable=False,
         unique=True,
     )
-    # Core invoice fields
-    vendor_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    vendor_tax_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    invoice_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    invoice_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    total_amount: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    tax_amount: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    line_items: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    # Per-field confidence scores stored as {"field_name": 0.95, ...}
-    field_confidence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # Overall extraction confidence (average of field scores)
-    overall_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ocr_result_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("ocr_results.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    extracted_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    confidence_scores: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    extraction_version: Mapped[str] = mapped_column(String(50), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     # Relationships
     invoice: Mapped[Invoice] = relationship("Invoice", back_populates="extracted_data")
+    ocr_result: Mapped[OCRResult] = relationship("OCRResult")
 
     def __repr__(self) -> str:
         return f"<ExtractedData invoice={self.invoice_id!r}>"
@@ -374,10 +357,9 @@ class ExtractedData(Base):
 
 class UserCorrection(Base):
     """
-    Field-level diffs submitted by the user after reviewing extraction.
+    JSON-level diffs submitted by the user after reviewing extraction.
 
-    ``original_value`` is snapshotted at correction time so admin can see
-    exactly what was changed without joining other tables.
+    Stores the full corrected document and a computed diff from the original.
     """
 
     __tablename__ = "user_corrections"
@@ -391,24 +373,27 @@ class UserCorrection(Base):
         ForeignKey("invoices.id", ondelete="CASCADE"),
         nullable=False,
     )
-    user_id: Mapped[str] = mapped_column(
+    extracted_data_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("extracted_data.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    corrected_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    diff_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    corrected_by_user_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    field_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    original_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    corrected_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     # Relationships
     invoice: Mapped[Invoice] = relationship("Invoice", back_populates="corrections")
-    user: Mapped[User] = relationship("User", back_populates="corrections")
+    extracted_data: Mapped[ExtractedData] = relationship("ExtractedData")
+    user: Mapped[User] = relationship("User", back_populates="corrections", foreign_keys=[corrected_by_user_id])
 
     def __repr__(self) -> str:
-        return (
-            f"<UserCorrection invoice={self.invoice_id!r} field={self.field_name!r}>"
-        )
+        return f"<UserCorrection invoice={self.invoice_id!r}>"
 
 
 class AdminReview(Base):
@@ -425,26 +410,27 @@ class AdminReview(Base):
         nullable=False,
         unique=True,
     )
-    reviewed_by: Mapped[str] = mapped_column(
+    reviewer_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("users.id"), nullable=False
     )
-    decision: Mapped[AdminDecision] = mapped_column(
-        Enum(AdminDecision), nullable=False
+    action: Mapped[AdminReviewAction] = mapped_column(
+        Enum(AdminReviewAction, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False
     )
-    # Override values if decision == OVERRIDDEN; NULL otherwise
-    override_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Override values if action == OVERRIDDEN; NULL otherwise
+    override_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    reviewed_at: Mapped[datetime] = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     # Relationships
     invoice: Mapped[Invoice] = relationship("Invoice", back_populates="admin_review")
-    reviewer: Mapped[User] = relationship("User", foreign_keys=[reviewed_by])
+    reviewer: Mapped[User] = relationship("User", foreign_keys=[reviewer_id])
 
     def __repr__(self) -> str:
         return (
-            f"<AdminReview invoice={self.invoice_id!r} decision={self.decision!r}>"
+            f"<AdminReview invoice={self.invoice_id!r} action={self.action!r}>"
         )
 
 
@@ -515,7 +501,8 @@ class SignedLink(Base):
     )
     token: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
     link_type: Mapped[SignedLinkType] = mapped_column(
-        Enum(SignedLinkType), nullable=False
+        Enum(SignedLinkType, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -559,7 +546,7 @@ class WebhookEvent(Base):
     )
     raw_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[WebhookEventStatus] = mapped_column(
-        Enum(WebhookEventStatus),
+        Enum(WebhookEventStatus, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
         nullable=False,
         default=WebhookEventStatus.RECEIVED,
     )

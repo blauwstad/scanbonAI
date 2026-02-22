@@ -4,19 +4,16 @@
 # Usage (local):
 #   cp .env.example .env          # fill in real values
 #   docker compose up -d
-#   docker compose exec api alembic upgrade head
+#   docker compose exec api python -m app.scripts.seed_demo
 #
 # Usage (Dokploy):
 #   Paste this file into a new Compose application.
-#   All bind-mount host paths must be pre-created on the VPS:
-#     sudo mkdir -p /data/scanbonai/{postgres,redis,invoices,backups}
-#     sudo chown -R 1000:1000 /data/scanbonai
 # =============================================================================
 
 name: scanbonai
 
 # ---------------------------------------------------------------------------
-# Shared extension anchors – avoids repeating limits / labels
+# Shared extension anchors
 # ---------------------------------------------------------------------------
 x-logging: &default-logging
   driver: "json-file"
@@ -38,7 +35,7 @@ x-api-build: &api-build
 services:
 
   # --------------------------------------------------------------------------
-  # PostgreSQL 16 – primary datastore
+  # PostgreSQL 16
   # --------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
@@ -49,7 +46,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-scanbonai}
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - /data/scanbonai/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scanbonai} -d ${POSTGRES_DB:-scanbonai}"]
       interval: 10s
@@ -58,7 +55,6 @@ services:
       start_period: 30s
     networks:
       - backend
-    # db must NOT be exposed to the public network
     expose:
       - "5432"
     deploy:
@@ -72,7 +68,7 @@ services:
     logging: *default-logging
 
   # --------------------------------------------------------------------------
-  # Redis 7 – Celery broker + result backend + cache
+  # Redis 7
   # --------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
@@ -84,7 +80,7 @@ services:
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
     volumes:
-      - /data/scanbonai/redis:/data
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -106,7 +102,7 @@ services:
     logging: *default-logging
 
   # --------------------------------------------------------------------------
-  # FastAPI backend – HTTP API + webhook receiver
+  # FastAPI backend
   # --------------------------------------------------------------------------
   api:
     <<: [*api-build, *on-failure]
@@ -120,19 +116,18 @@ services:
     env_file:
       - .env
     environment:
-      # Override STORAGE_PATH to match the bind-mount target
       STORAGE_PATH: /data/invoices
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - /data/scanbonai/invoices:/data/invoices
+      - invoice_data:/data/invoices
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -151,7 +146,7 @@ services:
     logging: *default-logging
 
   # --------------------------------------------------------------------------
-  # Celery worker – background invoice processing / OCR pipeline
+  # Celery worker
   # --------------------------------------------------------------------------
   worker:
     <<: [*api-build, *on-failure]
@@ -165,7 +160,7 @@ services:
     environment:
       STORAGE_PATH: /data/invoices
     volumes:
-      - /data/scanbonai/invoices:/data/invoices
+      - invoice_data:/data/invoices
     depends_on:
       db:
         condition: service_healthy
@@ -179,6 +174,7 @@ services:
       start_period: 30s
     networks:
       - backend
+      - frontend  # needs internet for DeepSeek OCR + WhatsApp API
     deploy:
       resources:
         limits:
@@ -190,7 +186,7 @@ services:
     logging: *default-logging
 
   # --------------------------------------------------------------------------
-  # React / Vite frontend – multi-stage build (node build -> nginx serve)
+  # React / Vite frontend
   # --------------------------------------------------------------------------
   frontend:
     build:
@@ -198,11 +194,11 @@ services:
       dockerfile: frontend/Dockerfile
     <<: *on-failure
     ports:
-      - "127.0.0.1:3000:3000"
+      - "0.0.0.0:3001:3000"
     networks:
       - frontend
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -217,94 +213,20 @@ services:
           memory: 32M
     logging: *default-logging
 
-  # --------------------------------------------------------------------------
-  # Nginx reverse proxy – TLS termination + routing
-  # --------------------------------------------------------------------------
-  proxy:
-    image: nginx:1.27-alpine
-    <<: *on-failure
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      # SSL certificates – provision via Dokploy "Domains" tab (Let's Encrypt)
-      # or mount your own certs at the paths referenced in nginx.conf:
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-    depends_on:
-      api:
-        condition: service_healthy
-      frontend:
-        condition: service_healthy
-    networks:
-      - frontend
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 64M
-        reservations:
-          cpus: "0.05"
-          memory: 16M
-    logging: *default-logging
-
-  # --------------------------------------------------------------------------
-  # FUTURE SERVICE PLACEHOLDERS
-  # --------------------------------------------------------------------------
-  # Uncomment and configure when these services are ready for deployment.
-
-  # payments-webhook:
-  #   <<: [*api-build, *on-failure]
-  #   command: uvicorn app.payments.webhook:app --host 0.0.0.0 --port 8001
-  #   env_file: .env
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - backend
-  #     - frontend
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: "0.5"
-  #         memory: 256M
-
-  # expert-scoring-worker:
-  #   <<: [*api-build, *on-failure]
-  #   command: celery -A app.workers.expert_scoring worker -Q expert_scoring -l info
-  #   env_file: .env
-  #   environment:
-  #     EXPERT_POOL_ENABLED: "true"
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - backend
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: "2.0"
-  #         memory: 1G
-
 # ---------------------------------------------------------------------------
 # Networks
 # ---------------------------------------------------------------------------
 networks:
   backend:
     driver: bridge
-    internal: true   # no direct internet access from db / redis / worker
+    internal: true
   frontend:
     driver: bridge
 
 # ---------------------------------------------------------------------------
-# Named volumes (optional – only used if you prefer Docker-managed volumes
-# instead of the bind mounts above; bind mounts are the Dokploy default)
+# Named volumes
 # ---------------------------------------------------------------------------
-# volumes:
-#   postgres_data:
-#   redis_data:
-#   invoice_data:
+volumes:
+  postgres_data:
+  redis_data:
+  invoice_data:

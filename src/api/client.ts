@@ -221,6 +221,32 @@ export const adminApi = {
       .then((r) => r.data);
   },
 
+  // Client management
+  listClients(params?: { page?: number; page_size?: number; search?: string; status?: string; plan?: string }) {
+    return apiClient.get("/admin/clients", { params }).then((r) => r.data);
+  },
+  getClient(id: string) {
+    return apiClient.get(`/admin/clients/${id}`).then((r) => r.data);
+  },
+  updateClient(id: string, data: any) {
+    return apiClient.put(`/admin/clients/${id}`, data).then((r) => r.data);
+  },
+  enrichClient(id: string, registryType: string) {
+    return apiClient.post(`/admin/clients/${id}/enrich`, { registry_type: registryType }).then((r) => r.data);
+  },
+  setClientConsent(id: string, consent: boolean) {
+    return apiClient.post(`/admin/clients/${id}/consent`, { consent }).then((r) => r.data);
+  },
+  suspendClient(id: string) {
+    return apiClient.post(`/admin/clients/${id}/suspend`).then((r) => r.data);
+  },
+  reactivateClient(id: string) {
+    return apiClient.post(`/admin/clients/${id}/reactivate`).then((r) => r.data);
+  },
+  grantCredits(id: string, amount: number, reason?: string) {
+    return apiClient.post(`/admin/clients/${id}/grant-credits`, { amount, reason }).then((r) => r.data);
+  },
+
   // WhatsApp settings
   getWhatsAppSettings(): Promise<ApiResponse<any>> {
     return apiClient.get("/admin/whatsapp-settings").then((r) => r.data);

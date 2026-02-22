@@ -262,6 +262,23 @@ async def _process_invoice_async(
         log.debug("ocr_worker.user_resolved", user_id=user.id, tenant_id=tenant.id)
 
         # ------------------------------------------------------------------
+        # Billing enforcement (defense in depth)
+        # ------------------------------------------------------------------
+        from app.services.billing import can_process_invoice, deduct_credit, is_ultra_plan
+        from app.models import UserStatus
+
+        if user.status != UserStatus.ACTIVE:
+            log.warning("ocr_worker.user_not_active", user_id=user.id, status=user.status.value)
+            await _mark_webhook_failed(db, message_id, f"User not active: {user.status.value}")
+            return {"status": "billing_denied", "reason": "not_active"}
+
+        allowed, reason = await can_process_invoice(db, user)
+        if not allowed:
+            log.warning("ocr_worker.billing_denied", user_id=user.id, reason=reason)
+            await _mark_webhook_failed(db, message_id, f"Billing check: {reason}")
+            return {"status": "billing_denied", "reason": reason}
+
+        # ------------------------------------------------------------------
         # Step 2: Create invoice record
         # ------------------------------------------------------------------
         invoice_id = str(uuid.uuid4())
@@ -497,7 +514,15 @@ async def _process_invoice_async(
                 # Non-fatal: don't fail the task because a WhatsApp message failed
 
         # ------------------------------------------------------------------
-        # Step 9: Mark webhook event as processed
+        # Step 9: Deduct credit if on credits plan
+        # ------------------------------------------------------------------
+        allowed, reason = await can_process_invoice(db, user)
+        if reason == "credits_available":
+            await deduct_credit(db, str(user.id), invoice_id)
+            log.info("ocr_worker.credit_deducted", user_id=user.id, invoice_id=invoice_id)
+
+        # ------------------------------------------------------------------
+        # Step 10: Mark webhook event as processed
         # ------------------------------------------------------------------
         await _mark_webhook_processed(db, message_id, invoice_id)
         await db.commit()

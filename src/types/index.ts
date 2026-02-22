@@ -366,6 +366,89 @@ export interface ExportResult {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Billing Types
+// ─────────────────────────────────────────────────────────────
+
+export interface BillingPlan {
+  code: string;
+  name: string;
+  plan_type: string;
+  credits_amount: number | null;
+}
+
+export interface ActivationInfo {
+  user_name: string | null;
+  phone_masked: string;
+  plans: BillingPlan[];
+}
+
+export interface CheckoutSessionResponse {
+  checkout_url: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin Client Types
+// ─────────────────────────────────────────────────────────────
+
+export interface ClientListItem {
+  id: string;
+  whatsapp_phone: string;
+  display_name: string | null;
+  company_name: string | null;
+  status: string;
+  plan_code: string | null;
+  remaining_credits: number | null;
+  subscription_status: string | null;
+  invoice_count: number;
+  created_at: string;
+}
+
+export interface ClientDetail {
+  id: string;
+  tenant_id: string;
+  whatsapp_phone: string;
+  display_name: string | null;
+  status: string;
+  company_name: string | null;
+  legal_name: string | null;
+  contact_name: string | null;
+  address_street: string | null;
+  address_postal_code: string | null;
+  address_city: string | null;
+  address_country: string | null;
+  vat_number: string | null;
+  kvk_number: string | null;
+  kbo_number: string | null;
+  enrichment_source: string | null;
+  enrichment_last_fetched_at: string | null;
+  enrichment_status: string;
+  consent_registry_enrichment: boolean;
+  admin_notes: string | null;
+  plan_code: string | null;
+  subscription_status: string | null;
+  remaining_credits: number | null;
+  current_period_end: string | null;
+  invoice_count: number;
+  created_at: string;
+  enrichment_history: Array<{
+    id: string;
+    registry_type: string;
+    identifier: string;
+    requested_at: string | null;
+    success: boolean;
+    error_message: string | null;
+    response_status_code: number | null;
+    applied_fields: Record<string, any> | null;
+  }>;
+  recent_invoices: Array<{
+    id: string;
+    status: string;
+    month_partition: string;
+    created_at: string | null;
+  }>;
+}
+
+// ─────────────────────────────────────────────────────────────
 // FUTURE: Expert Portal Types
 // ─────────────────────────────────────────────────────────────
 

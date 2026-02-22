@@ -9,6 +9,7 @@ import {
   LogOut,
   MessageSquare,
   Receipt,
+  Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -28,6 +29,7 @@ const adminNav: NavItem[] = [
   { label: "Metrics", href: "/admin/metrics", icon: BarChart3 },
   { label: "Export", href: "/admin/export", icon: Download },
   { label: "WhatsApp Setup", href: "/admin/whatsapp", icon: MessageSquare },
+  { label: "Clients", href: "/admin/clients", icon: Users },
 ];
 
 export function Sidebar() {

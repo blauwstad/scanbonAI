@@ -87,7 +87,7 @@ router = APIRouter(prefix="/hook", tags=["webhooks"])
 async def verify_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-) -> dict[str, Any]:
+) -> Any:
     """
     Respond to Meta's webhook verification challenge.
 
@@ -147,8 +147,9 @@ async def verify_webhook(
         tenant_id=wa_settings.tenant_id,
         phone_number_id=wa_settings.phone_number_id,
     )
-    # Meta expects the challenge as a plain integer in the response body
-    return int(challenge)  # type: ignore[return-value]
+    # Meta expects the challenge echoed back as plain text
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=challenge)
 
 
 # ---------------------------------------------------------------------------

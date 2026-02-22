@@ -117,6 +117,9 @@ class UserSchema(BaseModel):
             name = d.get("name") or "user"
             d["email"] = f"{name.lower().replace(' ', '.')}@scanbon.ai"
         d.setdefault("is_active", True)
+        # Convert enum to string value for serialization
+        if "role" in d and hasattr(d["role"], "value"):
+            d["role"] = d["role"].value
         return d
 
 

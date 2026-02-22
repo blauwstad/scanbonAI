@@ -1,7 +1,9 @@
 import { useState, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
-import { Receipt, User, Shield } from "lucide-react";
+import { useNavigate, Link } from "react-router-dom";
+import { Receipt, Phone, Lock } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -14,27 +16,37 @@ import apiClient from "@/api/client";
 import toast from "react-hot-toast";
 
 export function LoginPage() {
-  const [isSubmitting, setIsSubmitting] = useState("");
+  const [phone, setPhone] = useState("");
+  const [password, setPassword] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
   const { setAuth } = useAuthStore();
 
-  const handleDemoLogin = useCallback(
-    async (role: "user" | "admin") => {
-      setIsSubmitting(role);
+  const handleLogin = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!phone || !password) return;
+
+      setIsSubmitting(true);
       try {
-        const { data: res } = await apiClient.post("/auth/demo-login", { role });
+        const { data: res } = await apiClient.post("/auth/login", {
+          phone,
+          password,
+        });
         const { user, access_token, refresh_token } = res.data;
         localStorage.setItem("refresh_token", refresh_token);
         setAuth(user, access_token);
         toast.success(`Welcome, ${user.name}!`);
-        navigate(role === "admin" ? "/admin" : "/invoices", { replace: true });
+        navigate(user.role === "admin" ? "/admin" : "/invoices", {
+          replace: true,
+        });
       } catch {
-        toast.error("Demo login failed. Is the API running?");
+        toast.error("Invalid phone number or password.");
       } finally {
-        setIsSubmitting("");
+        setIsSubmitting(false);
       }
     },
-    [setAuth, navigate],
+    [phone, password, setAuth, navigate],
   );
 
   return (
@@ -53,50 +65,63 @@ export function LoginPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Demo Login</CardTitle>
+            <CardTitle>Sign In</CardTitle>
             <CardDescription>
-              Choose a role to explore the application
+              Enter your phone number and password
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <Button
-              className="w-full justify-start gap-3 h-auto py-4"
-              variant="outline"
-              disabled={!!isSubmitting}
-              onClick={() => handleDemoLogin("user")}
-            >
-              <User className="h-5 w-5 text-blue-500 shrink-0" />
-              <div className="text-left">
-                <div className="font-medium">
-                  {isSubmitting === "user" ? "Logging in..." : "Jan de Vries (User)"}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  View invoices, submit corrections, confirm extractions
+          <CardContent>
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="phone">Phone Number</Label>
+                <div className="relative">
+                  <Phone className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    id="phone"
+                    type="tel"
+                    placeholder="+31600000001"
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                    className="pl-10"
+                    required
+                    disabled={isSubmitting}
+                  />
                 </div>
               </div>
-            </Button>
 
-            <Button
-              className="w-full justify-start gap-3 h-auto py-4"
-              variant="outline"
-              disabled={!!isSubmitting}
-              onClick={() => handleDemoLogin("admin")}
-            >
-              <Shield className="h-5 w-5 text-amber-500 shrink-0" />
-              <div className="text-left">
-                <div className="font-medium">
-                  {isSubmitting === "admin" ? "Logging in..." : "Admin Demo (Admin)"}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  Review all invoices, approve/reject, view metrics, export
+              <div className="space-y-2">
+                <Label htmlFor="password">Password</Label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    id="password"
+                    type="password"
+                    placeholder="Your password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="pl-10"
+                    required
+                    disabled={isSubmitting}
+                  />
                 </div>
               </div>
-            </Button>
+
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={isSubmitting || !phone || !password}
+              >
+                {isSubmitting ? "Signing in..." : "Sign In"}
+              </Button>
+            </form>
           </CardContent>
         </Card>
 
-        <p className="mt-6 text-center text-xs text-muted-foreground">
-          Demo environment with 6 sample invoices from Dutch suppliers.
+        <p className="mt-6 text-center text-sm text-muted-foreground">
+          Don't have an account?{" "}
+          <Link to="/register" className="text-primary hover:underline font-medium">
+            Create one
+          </Link>
         </p>
       </div>
     </div>

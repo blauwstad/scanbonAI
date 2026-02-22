@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Admin registration
+    # ------------------------------------------------------------------
+    ADMIN_INVITE_CODE: str = Field(
+        default="",
+        description="Invite code required to register as admin. Leave empty to disable admin registration.",
+    )
+
+    # ------------------------------------------------------------------
     # Observability
     # ------------------------------------------------------------------
     LOG_LEVEL: str = Field(

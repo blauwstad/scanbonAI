@@ -4,6 +4,7 @@ import { AuthGuard } from "@/components/common/auth-guard";
 
 // Auth pages
 import { LoginPage } from "@/pages/auth/login-page";
+import { RegisterPage } from "@/pages/auth/register-page";
 import { VerifyPage } from "@/pages/auth/verify-page";
 
 // User pages
@@ -22,6 +23,10 @@ export const router = createBrowserRouter([
   {
     path: "/",
     element: <LoginPage />,
+  },
+  {
+    path: "/register",
+    element: <RegisterPage />,
   },
   {
     path: "/auth/verify",

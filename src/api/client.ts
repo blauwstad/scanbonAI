@@ -13,6 +13,7 @@ import type {
   AdminMetrics,
   AuthResponse,
   LoginRequest,
+  RegisterRequest,
   VerifyTokenRequest,
   UserCorrection,
   AdminReview,
@@ -109,8 +110,12 @@ apiClient.interceptors.response.use(
 // ─────────────────────────────────────────────────────────────
 
 export const authApi = {
-  login(data: LoginRequest): Promise<ApiResponse<{ message: string }>> {
+  login(data: LoginRequest) {
     return apiClient.post("/auth/login", data).then((r) => r.data);
+  },
+
+  register(data: RegisterRequest) {
+    return apiClient.post("/auth/register", data).then((r) => r.data);
   },
 
   verifyToken(data: VerifyTokenRequest): Promise<ApiResponse<AuthResponse>> {

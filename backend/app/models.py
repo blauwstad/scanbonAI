@@ -89,6 +89,12 @@ class SignedLinkType(str, enum.Enum):
     CONFIRM = "confirm"
 
 
+class UserRole(str, enum.Enum):
+    USER = "user"
+    ADMIN = "admin"
+    SUPERADMIN = "superadmin"
+
+
 class WebhookEventStatus(str, enum.Enum):
     RECEIVED = "received"
     PROCESSING = "processing"
@@ -158,7 +164,11 @@ class User(Base):
     )
     whatsapp_phone: Mapped[str] = mapped_column(String(20), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    role: Mapped[str] = mapped_column(String, nullable=False, server_default='user')
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, values_callable=lambda e: [x.value for x in e], create_constraint=False, native_enum=False),
+        nullable=False, default=UserRole.USER, server_default='user'
+    )
+    password_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Auth token for API access; stored as raw token for demo simplicity
     auth_token: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

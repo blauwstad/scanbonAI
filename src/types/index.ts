@@ -323,7 +323,16 @@ export interface AuthState {
 }
 
 export interface LoginRequest {
-  email: string;
+  phone: string;
+  password: string;
+}
+
+export interface RegisterRequest {
+  name: string;
+  phone: string;
+  password: string;
+  role: "user" | "admin";
+  admin_invite_code?: string;
 }
 
 export interface VerifyTokenRequest {

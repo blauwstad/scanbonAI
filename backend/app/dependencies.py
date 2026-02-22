@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
-from app.models import Tenant, User
+from app.models import Tenant, User, UserRole
 
 logger = structlog.get_logger(__name__)
 
@@ -138,7 +138,7 @@ async def require_admin(
         async def list_all(admin: User = Depends(require_admin)) -> ...:
             ...
     """
-    if current_user.role != "admin":
+    if current_user.role not in (UserRole.ADMIN, "admin"):
         logger.warning(
             "admin_access_denied",
             user_id=current_user.id,

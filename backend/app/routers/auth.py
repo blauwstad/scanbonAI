@@ -1,31 +1,13 @@
 """
-Authentication router for ScanbonAI – magic-link via WhatsApp.
+Authentication router for ScanbonAI.
 
 Endpoints
 ---------
-POST /api/v1/auth/magic-link    – Request a magic link sent as a WhatsApp message.
-GET  /api/v1/auth/verify/{token} – Exchange a magic-link token for a session.
+POST /api/v1/auth/register       – Create a new account.
+POST /api/v1/auth/login          – Log in with phone + password.
 GET  /api/v1/auth/me             – Return the currently authenticated user.
-
-Magic-link flow
----------------
-1. User submits their phone number and tenant slug.
-2. Server generates a short-lived signed token (itsdangerous, 15 min TTL).
-3. Server sends the token as a WhatsApp message containing a deep-link URL.
-4. User taps the link; browser/app hits GET /api/v1/auth/verify/{token}.
-5. Server validates the token, creates (or retrieves) a User record, and
-   issues a long-lived session token (stored as a SHA-256 hash in the DB).
-6. The session token is returned in the response body and should be stored
-   client-side and sent as ``Authorization: Bearer <token>`` on every request.
-
-Security notes
---------------
-- Magic-link tokens are signed with ``settings.SECRET_KEY`` and expire in
-  15 minutes to limit the attack window if a message is intercepted.
-- Session tokens are stored hashed (SHA-256) in ``users.session_token_hash``
-  so a DB breach does not expose usable credentials.
-- The same magic-link token cannot be used twice (the session_token_hash is
-  replaced on each verification, invalidating any previous session for that user).
+POST /api/v1/auth/magic-link     – Request a magic link sent as a WhatsApp message.
+GET  /api/v1/auth/verify/{token} – Exchange a magic-link token for a session.
 """
 
 from __future__ import annotations
@@ -34,16 +16,17 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from itsdangerous import BadData, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.dependencies import CurrentUser, DBSession, get_current_user
-from app.models import Tenant, User
+from app.models import Tenant, User, UserRole
 from app.schemas import (
     AuthVerifyResponse,
     MagicLinkRequest,
@@ -73,8 +56,205 @@ def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+
 # ---------------------------------------------------------------------------
-# POST /api/v1/auth/magic-link
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    phone: str = Field(..., min_length=7, max_length=20, description="Phone in E.164 format")
+    password: str = Field(..., min_length=6, max_length=128)
+    role: str = Field(default="user", pattern=r"^(user|admin)$")
+    admin_invite_code: str | None = Field(default=None, description="Required for admin registration")
+
+
+class LoginRequest(BaseModel):
+    phone: str = Field(..., min_length=7, max_length=20)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthResponse(BaseModel):
+    user: UserSchema
+    access_token: str
+    refresh_token: str
+    expires_at: str
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/register
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/register",
+    response_model=SuccessResponse[AuthResponse],
+    summary="Create a new account",
+)
+async def register(
+    body: RegisterRequest,
+    db: DBSession,
+) -> SuccessResponse[AuthResponse]:
+    """
+    Register a new user account with phone + password.
+
+    For admin registration, a valid ``admin_invite_code`` must be provided
+    matching the server's ADMIN_INVITE_CODE environment variable.
+    """
+    log = logger.bind(phone=body.phone[:4] + "****", role=body.role)
+
+    # Validate admin invite code
+    if body.role == "admin":
+        if not settings.ADMIN_INVITE_CODE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin registration is disabled.",
+            )
+        if body.admin_invite_code != settings.ADMIN_INVITE_CODE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid admin invite code.",
+            )
+
+    # Resolve default tenant (first tenant in DB)
+    tenant_result = await db.execute(select(Tenant).limit(1))
+    tenant: Tenant | None = tenant_result.scalars().first()
+
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No tenant configured. Please run seed script first.",
+        )
+
+    # Check for existing user with same phone in this tenant
+    existing = await db.execute(
+        select(User).where(
+            User.whatsapp_phone == body.phone,
+            User.tenant_id == tenant.id,
+        )
+    )
+    if existing.scalars().first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this phone number already exists.",
+        )
+
+    # Create user
+    auth_token = secrets.token_urlsafe(48)
+    user_role = UserRole.ADMIN if body.role == "admin" else UserRole.USER
+    user = User(
+        tenant_id=tenant.id,
+        whatsapp_phone=body.phone,
+        display_name=body.name,
+        role=user_role,
+        password_hash=_hash_password(body.password),
+        auth_token=auth_token,
+    )
+    db.add(user)
+    await db.flush()
+
+    log.info("auth.user.registered", user_id=user.id)
+
+    expires = datetime.now(tz=timezone.utc) + timedelta(days=_SESSION_TTL_DAYS)
+
+    return SuccessResponse(
+        data=AuthResponse(
+            user=UserSchema.model_validate(user),
+            access_token=auth_token,
+            refresh_token=f"refresh-{user.id[:8]}",
+            expires_at=expires.isoformat(),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/login
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/login",
+    response_model=SuccessResponse[AuthResponse],
+    summary="Log in with phone and password",
+)
+async def login(
+    body: LoginRequest,
+    db: DBSession,
+) -> SuccessResponse[AuthResponse]:
+    """
+    Authenticate with phone number and password.
+    Returns access and refresh tokens on success.
+    """
+    log = logger.bind(phone=body.phone[:4] + "****")
+
+    result = await db.execute(
+        select(User).where(User.whatsapp_phone == body.phone)
+    )
+    user: User | None = result.scalars().first()
+
+    if user is None or not user.password_hash:
+        log.warning("auth.login.failed", reason="user_not_found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid phone number or password.",
+        )
+
+    if not _verify_password(body.password, user.password_hash):
+        log.warning("auth.login.failed", reason="bad_password", user_id=user.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid phone number or password.",
+        )
+
+    # Issue new session token
+    auth_token = secrets.token_urlsafe(48)
+    user.auth_token = auth_token
+
+    log.info("auth.login.success", user_id=user.id)
+
+    expires = datetime.now(tz=timezone.utc) + timedelta(days=_SESSION_TTL_DAYS)
+
+    return SuccessResponse(
+        data=AuthResponse(
+            user=UserSchema.model_validate(user),
+            access_token=auth_token,
+            refresh_token=f"refresh-{user.id[:8]}",
+            expires_at=expires.isoformat(),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/auth/me
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/me",
+    response_model=SuccessResponse[UserSchema],
+    summary="Get current user",
+)
+async def get_me(
+    current_user: CurrentUser,
+) -> SuccessResponse[UserSchema]:
+    """
+    Return the profile of the currently authenticated user.
+
+    Uses the ``get_current_user`` dependency which validates the Bearer token.
+    """
+    return SuccessResponse(data=UserSchema.model_validate(current_user))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/magic-link  (kept for future WhatsApp integration)
 # ---------------------------------------------------------------------------
 
 
@@ -92,9 +272,6 @@ async def request_magic_link(
 
     The endpoint always returns 200 (even when the phone/tenant combination
     is not found) to avoid user enumeration.
-
-    Rate limiting is applied at the infrastructure layer (API gateway / nginx)
-    and is NOT implemented here to keep the skeleton simple.
     """
     log = logger.bind(
         phone=body.phone_number[:4] + "****",
@@ -111,7 +288,6 @@ async def request_magic_link(
 
     if tenant is None:
         log.warning("auth.magic_link.tenant_not_found")
-        # Return a generic success to prevent tenant slug enumeration
         return SuccessResponse(data=MagicLinkResponse())
 
     # Resolve or create user
@@ -124,13 +300,12 @@ async def request_magic_link(
     user: User | None = user_result.scalars().first()
 
     if user is None:
-        # Auto-create user on first magic-link request
         user = User(
             tenant_id=tenant.id,
             whatsapp_phone=body.phone_number,
         )
         db.add(user)
-        await db.flush()  # get the generated ID
+        await db.flush()
         log.info("auth.user.created", user_id=user.id)
 
     # Generate magic-link token
@@ -138,12 +313,9 @@ async def request_magic_link(
     token_payload = {"user_id": user.id, "tenant_id": tenant.id}
     magic_token: str = serializer.dumps(token_payload)
 
-    # Build the magic-link URL
-    # FUTURE: derive base_url from settings.BASE_URL
-    base_url = "https://app.scanbonai.com"
+    base_url = "https://demo.qlickz.com"
     magic_url = f"{base_url}/api/v1/auth/verify/{magic_token}"
 
-    # Send via WhatsApp
     message_text = (
         f"Your ScanbonAI login link (valid 15 minutes):\n{magic_url}\n\n"
         "Do not share this link with anyone."
@@ -178,17 +350,6 @@ async def verify_magic_link(
 ) -> SuccessResponse[AuthVerifyResponse]:
     """
     Exchange a magic-link token for a session token.
-
-    On success:
-    - Returns a session token in the response body.
-    - The token should be stored client-side and sent as
-      ``Authorization: Bearer <token>`` on subsequent requests.
-    - The previous session (if any) is invalidated.
-
-    Raises
-    ------
-    401 Unauthorized
-        If the token is invalid or has expired.
     """
     serializer = _get_magic_link_serializer()
 
@@ -214,7 +375,6 @@ async def verify_magic_link(
             detail="Malformed magic link payload.",
         )
 
-    # Load user
     result = await db.execute(
         select(User).where(
             User.id == user_id,
@@ -229,7 +389,6 @@ async def verify_magic_link(
             detail="User account not found or inactive.",
         )
 
-    # Issue a new session token
     raw_session_token = secrets.token_urlsafe(48)
     session_expires_at = datetime.now(tz=timezone.utc) + timedelta(
         days=_SESSION_TTL_DAYS
@@ -250,83 +409,4 @@ async def verify_magic_link(
             session_expires_at=session_expires_at,
         ),
         meta={"session_token": raw_session_token},
-    )
-
-
-# ---------------------------------------------------------------------------
-# GET /api/v1/auth/me
-# ---------------------------------------------------------------------------
-
-
-@router.get(
-    "/me",
-    response_model=SuccessResponse[UserSchema],
-    summary="Get current user",
-)
-async def get_me(
-    current_user: CurrentUser,
-) -> SuccessResponse[UserSchema]:
-    """
-    Return the profile of the currently authenticated user.
-
-    Uses the ``get_current_user`` dependency which validates the Bearer token.
-    """
-    return SuccessResponse(data=UserSchema.model_validate(current_user))
-
-
-# ---------------------------------------------------------------------------
-# POST /api/v1/auth/demo-login  – bypass for demo purposes
-# ---------------------------------------------------------------------------
-
-
-class DemoLoginRequest(BaseModel):
-    role: str = "user"
-
-
-class DemoAuthResponse(BaseModel):
-    user: UserSchema
-    access_token: str
-    refresh_token: str
-    expires_at: str
-
-
-@router.post(
-    "/demo-login",
-    response_model=SuccessResponse[DemoAuthResponse],
-    summary="Demo login (no magic link required)",
-)
-async def demo_login(
-    body: DemoLoginRequest,
-    db: DBSession,
-) -> SuccessResponse[DemoAuthResponse]:
-    """
-    Instant login for demo purposes. Accepts ``role`` ("user" or "admin")
-    and returns the pre-seeded auth token so the frontend can authenticate
-    without a WhatsApp magic-link flow.
-    """
-    from datetime import timedelta
-
-    target_role = body.role if body.role in ("user", "admin") else "user"
-
-    from sqlalchemy import text as sa_text
-    result = await db.execute(
-        select(User).where(sa_text("role::text = :role")).params(role=target_role).limit(1)
-    )
-    user: User | None = result.scalars().first()
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No demo user with role '{target_role}' found. Run seed_demo first.",
-        )
-
-    expires = datetime.now(tz=timezone.utc) + timedelta(days=30)
-
-    return SuccessResponse(
-        data=DemoAuthResponse(
-            user=UserSchema.model_validate(user),
-            access_token=user.auth_token,
-            refresh_token=f"demo-refresh-{user.id[:8]}",
-            expires_at=expires.isoformat(),
-        )
     )

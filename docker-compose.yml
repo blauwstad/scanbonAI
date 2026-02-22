@@ -135,6 +135,7 @@ services:
     networks:
       - backend
       - frontend
+      - openclaw
     deploy:
       resources:
         limits:
@@ -175,6 +176,7 @@ services:
     networks:
       - backend
       - frontend  # needs internet for DeepSeek OCR + WhatsApp API
+      - openclaw
     deploy:
       resources:
         limits:
@@ -222,6 +224,9 @@ networks:
     internal: true
   frontend:
     driver: bridge
+  openclaw:
+    external: true
+    name: scanbonai-openclaw
 
 # ---------------------------------------------------------------------------
 # Named volumes

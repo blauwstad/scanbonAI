@@ -247,21 +247,12 @@ export const adminApi = {
     return apiClient.post(`/admin/clients/${id}/grant-credits`, { amount, reason }).then((r) => r.data);
   },
 
-  // WhatsApp settings
-  getWhatsAppSettings(): Promise<ApiResponse<any>> {
-    return apiClient.get("/admin/whatsapp-settings").then((r) => r.data);
+  // OpenClaw WhatsApp gateway
+  getOpenClawStatus(): Promise<ApiResponse<any>> {
+    return apiClient.get("/admin/openclaw/status").then((r) => r.data);
   },
-  createWhatsAppSettings(data: any): Promise<ApiResponse<any>> {
-    return apiClient.post("/admin/whatsapp-settings", data).then((r) => r.data);
-  },
-  updateWhatsAppSettings(data: any): Promise<ApiResponse<any>> {
-    return apiClient.put("/admin/whatsapp-settings", data).then((r) => r.data);
-  },
-  testWhatsAppConnection(): Promise<ApiResponse<any>> {
-    return apiClient.post("/admin/whatsapp-settings/test").then((r) => r.data);
-  },
-  getWebhookInfo(): Promise<ApiResponse<any>> {
-    return apiClient.get("/admin/whatsapp-settings/webhook-info").then((r) => r.data);
+  testOpenClawConnection(): Promise<ApiResponse<any>> {
+    return apiClient.post("/admin/openclaw/test").then((r) => r.data);
   },
 };
 

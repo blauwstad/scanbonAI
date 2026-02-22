@@ -152,6 +152,22 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # OpenClaw Integration
+    # ------------------------------------------------------------------
+    OPENCLAW_API_KEY: str = Field(
+        default="", description="Shared API key for authenticating OpenClaw agent requests.",
+    )
+    OPENCLAW_GATEWAY_URL: str = Field(
+        default="http://openclaw:18789", description="Base URL for the OpenClaw gateway.",
+    )
+    OPENCLAW_GATEWAY_TOKEN: str = Field(
+        default="", description="Bearer token for the OpenClaw gateway API.",
+    )
+    OPENCLAW_DEFAULT_TENANT_ID: str = Field(
+        default="", description="Default tenant UUID for single-number OpenClaw setup.",
+    )
+
+    # ------------------------------------------------------------------
     # Admin registration
     # ------------------------------------------------------------------
     ADMIN_INVITE_CODE: str = Field(

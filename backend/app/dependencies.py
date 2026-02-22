@@ -16,14 +16,16 @@ Inject these into route function signatures with ``Depends``:
 from __future__ import annotations
 
 import hashlib
+import hmac as hmac_mod
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import async_session
 from app.models import Tenant, User, UserRole
 
@@ -193,3 +195,29 @@ async def require_tenant_access(
 
 
 TenantAccess = Annotated[Tenant, Depends(require_tenant_access)]
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw API key authentication
+# ---------------------------------------------------------------------------
+
+
+async def require_openclaw_api_key(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> None:
+    """
+    Validate that the request carries the correct OpenClaw API key.
+
+    Raises 503 if OPENCLAW_API_KEY is not configured.
+    Raises 401 if the key does not match.
+    """
+    if not settings.OPENCLAW_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OpenClaw integration is not configured.",
+        )
+    if not hmac_mod.compare_digest(x_api_key, settings.OPENCLAW_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key.",
+        )

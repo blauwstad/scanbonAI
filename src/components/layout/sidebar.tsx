@@ -28,7 +28,7 @@ const adminNav: NavItem[] = [
   { label: "Invoices", href: "/admin/invoices", icon: Receipt },
   { label: "Metrics", href: "/admin/metrics", icon: BarChart3 },
   { label: "Export", href: "/admin/export", icon: Download },
-  { label: "WhatsApp Setup", href: "/admin/whatsapp", icon: MessageSquare },
+  { label: "WhatsApp", href: "/admin/whatsapp", icon: MessageSquare },
   { label: "Clients", href: "/admin/clients", icon: Users },
 ];
 

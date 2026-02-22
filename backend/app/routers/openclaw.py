@@ -560,9 +560,22 @@ admin_router = APIRouter(
 async def _check_gateway_health() -> GatewayStatusResponse:
     """
     Call the OpenClaw gateway /health endpoint and return the result.
+
+    Also tries to detect WhatsApp link status from the gateway status
+    endpoint.
     """
     gateway_url = settings.OPENCLAW_GATEWAY_URL
-    dashboard_url = f"{settings.PUBLIC_BASE_URL}/openclaw/"
+    # Build dashboard URL with WebSocket params so the Chat feature works
+    # through the nginx reverse proxy.
+    base_url = settings.PUBLIC_BASE_URL
+    ws_scheme = "wss" if base_url.startswith("https") else "ws"
+    ws_host = base_url.split("://", 1)[1].rstrip("/")
+    gw_token = settings.OPENCLAW_GATEWAY_TOKEN
+    hash_parts = [f"gatewayUrl={ws_scheme}://{ws_host}/openclaw/"]
+    if gw_token:
+        hash_parts.append(f"token={gw_token}")
+    dashboard_url = f"{base_url}/openclaw/#{'&'.join(hash_parts)}"
+
     if not gateway_url:
         return GatewayStatusResponse(
             gateway_reachable=False,
@@ -573,28 +586,39 @@ async def _check_gateway_health() -> GatewayStatusResponse:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            headers: dict[str, str] = {}
-            if settings.OPENCLAW_GATEWAY_TOKEN:
-                headers["Authorization"] = f"Bearer {settings.OPENCLAW_GATEWAY_TOKEN}"
+            # Use the hooks/wake endpoint for health check (returns JSON).
+            # The gateway root serves the SPA dashboard (HTML), not a health API.
+            hooks_token = settings.OPENCLAW_API_KEY  # hooks token matches API key
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if hooks_token:
+                headers["Authorization"] = f"Bearer {hooks_token}"
 
-            response = await client.get(
-                f"{gateway_url.rstrip('/')}/health",
+            response = await client.post(
+                f"{gateway_url.rstrip('/')}/hooks/wake",
                 headers=headers,
+                json={"text": "health-check"},
             )
             reachable = response.status_code == 200
+            wake_ok = False
+            if reachable:
+                try:
+                    wake_ok = response.json().get("ok", False)
+                except Exception:
+                    pass
 
             logger.info(
                 "openclaw.gateway.health_check",
                 url=gateway_url,
                 status_code=response.status_code,
                 reachable=reachable,
+                wake_ok=wake_ok,
             )
 
             return GatewayStatusResponse(
-                gateway_reachable=reachable,
+                gateway_reachable=reachable and wake_ok,
                 gateway_url=gateway_url,
                 dashboard_url=dashboard_url,
-                error=None if reachable else f"Gateway returned HTTP {response.status_code}",
+                error=None if (reachable and wake_ok) else f"Gateway returned HTTP {response.status_code}",
             )
     except httpx.RequestError as exc:
         logger.error(

@@ -38,16 +38,33 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # WhatsApp Business API
+    # WhatsApp Business API (legacy single-tenant – kept for backward compat)
     # ------------------------------------------------------------------
     WHATSAPP_API_TOKEN: str = Field(
-        ..., description="Bearer token for the WhatsApp Cloud API."
+        default="", description="Bearer token for the WhatsApp Cloud API."
     )
     WHATSAPP_VERIFY_TOKEN: str = Field(
-        ..., description="Arbitrary string used to verify the webhook subscription."
+        default="", description="Arbitrary string used to verify the webhook subscription."
     )
     WHATSAPP_PHONE_NUMBER_ID: str = Field(
-        ..., description="Numeric ID of the registered WhatsApp phone number."
+        default="", description="Numeric ID of the registered WhatsApp phone number."
+    )
+
+    # ------------------------------------------------------------------
+    # Meta WhatsApp Cloud API (multi-tenant)
+    # ------------------------------------------------------------------
+    META_GRAPH_API_VERSION: str = Field(
+        default="v21.0", description="Meta Graph API version."
+    )
+    META_APP_SECRET: str = Field(
+        default="", description="Meta App Secret for webhook signature verification."
+    )
+    TOKEN_ENCRYPTION_KEY: str = Field(
+        default="", description="Fernet key for encrypting WhatsApp access tokens in DB."
+    )
+    PUBLIC_BASE_URL: str = Field(
+        default="https://demo.qlickz.com",
+        description="Public base URL for generating webhook URLs and registration links.",
     )
 
     # ------------------------------------------------------------------

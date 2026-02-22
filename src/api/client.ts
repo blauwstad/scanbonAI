@@ -10,7 +10,6 @@ import type {
   InvoiceMetadata,
   InvoiceFilters,
   AdminInvoiceFilters,
-  AdminMetrics,
   AuthResponse,
   LoginRequest,
   RegisterRequest,
@@ -208,7 +207,7 @@ export const adminApi = {
     period?: "day" | "week" | "month" | "quarter";
     from_date?: string;
     to_date?: string;
-  }): Promise<ApiResponse<AdminMetrics>> {
+  }): Promise<ApiResponse<any>> {
     return apiClient
       .get("/admin/metrics", { params })
       .then((r) => r.data);
@@ -220,6 +219,23 @@ export const adminApi = {
     return apiClient
       .post("/admin/export", request)
       .then((r) => r.data);
+  },
+
+  // WhatsApp settings
+  getWhatsAppSettings(): Promise<ApiResponse<any>> {
+    return apiClient.get("/admin/whatsapp-settings").then((r) => r.data);
+  },
+  createWhatsAppSettings(data: any): Promise<ApiResponse<any>> {
+    return apiClient.post("/admin/whatsapp-settings", data).then((r) => r.data);
+  },
+  updateWhatsAppSettings(data: any): Promise<ApiResponse<any>> {
+    return apiClient.put("/admin/whatsapp-settings", data).then((r) => r.data);
+  },
+  testWhatsAppConnection(): Promise<ApiResponse<any>> {
+    return apiClient.post("/admin/whatsapp-settings/test").then((r) => r.data);
+  },
+  getWebhookInfo(): Promise<ApiResponse<any>> {
+    return apiClient.get("/admin/whatsapp-settings/webhook-info").then((r) => r.data);
   },
 };
 

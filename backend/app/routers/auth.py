@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.dependencies import CurrentUser, DBSession, get_current_user
-from app.models import Tenant, User, UserRole
+from app.models import RegistrationToken, Tenant, User, UserRole
 from app.schemas import (
     AuthVerifyResponse,
     MagicLinkRequest,
@@ -87,6 +87,12 @@ class AuthResponse(BaseModel):
     access_token: str
     refresh_token: str
     expires_at: str
+
+
+class WhatsAppRegisterRequest(BaseModel):
+    token: str = Field(..., description="Registration token from WhatsApp message")
+    name: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=6, max_length=128)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +257,102 @@ async def get_me(
     Uses the ``get_current_user`` dependency which validates the Bearer token.
     """
     return SuccessResponse(data=UserSchema.model_validate(current_user))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/auth/register/whatsapp
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/register/whatsapp",
+    response_model=SuccessResponse[AuthResponse],
+    summary="Register via WhatsApp token",
+)
+async def register_via_whatsapp(
+    body: WhatsAppRegisterRequest, db: DBSession
+) -> SuccessResponse[AuthResponse]:
+    """
+    Complete registration for a user who initiated contact via WhatsApp.
+
+    The ``token`` was previously sent to the user's phone as a registration
+    link.  It carries pre-filled phone number and tenant context so the user
+    only needs to supply their name and a password.
+    """
+    log = logger.bind(token=body.token[:8] + "…")
+
+    # 1. Look up the registration token
+    result = await db.execute(
+        select(RegistrationToken).where(RegistrationToken.token == body.token)
+    )
+    reg_token: RegistrationToken | None = result.scalars().first()
+
+    if reg_token is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invalid or unknown registration token.",
+        )
+
+    # 2. Validate: not expired, not already used
+    now = datetime.now(tz=timezone.utc)
+
+    if reg_token.expires_at < now:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Registration token has expired. Please request a new link.",
+        )
+
+    if reg_token.used_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This registration link has already been used.",
+        )
+
+    # 3. Check if user already exists with this phone + tenant
+    existing = await db.execute(
+        select(User).where(
+            User.whatsapp_phone == reg_token.phone_number,
+            User.tenant_id == reg_token.tenant_id,
+        )
+    )
+    if existing.scalars().first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Account already exists for this phone number.",
+        )
+
+    # 4. Create the user
+    auth_token = secrets.token_urlsafe(48)
+    user = User(
+        tenant_id=reg_token.tenant_id,
+        whatsapp_phone=reg_token.phone_number,
+        display_name=body.name,
+        role=UserRole.USER,
+        password_hash=_hash_password(body.password),
+        auth_token=auth_token,
+    )
+    db.add(user)
+    await db.flush()
+
+    # 5. Mark token as used
+    reg_token.used_at = now
+
+    log.info(
+        "auth.whatsapp_register.success",
+        user_id=user.id,
+        phone=reg_token.phone_number[:4] + "****",
+    )
+
+    expires = datetime.now(tz=timezone.utc) + timedelta(days=_SESSION_TTL_DAYS)
+
+    return SuccessResponse(
+        data=AuthResponse(
+            user=UserSchema.model_validate(user),
+            access_token=auth_token,
+            refresh_token=f"refresh-{user.id[:8]}",
+            expires_at=expires.isoformat(),
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

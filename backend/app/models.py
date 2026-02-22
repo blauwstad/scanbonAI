@@ -572,6 +572,92 @@ class WebhookEvent(Base):
         return f"<WebhookEvent id={self.message_id!r} status={self.status!r}>"
 
 
+class WhatsAppSettings(Base):
+    """
+    Per-tenant WhatsApp Cloud API configuration.
+
+    Stores the Meta Business credentials needed to send/receive WhatsApp
+    messages for a specific tenant.  The access_token is stored encrypted
+    using Fernet with the TOKEN_ENCRYPTION_KEY env variable.
+    """
+
+    __tablename__ = "whatsapp_settings"
+    __table_args__ = (
+        Index("ix_wa_settings_phone_number_id", "phone_number_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), primary_key=True, default=_uuid
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    phone_number_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    display_phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    waba_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    meta_app_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    access_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    webhook_verify_token: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    tenant: Mapped[Tenant] = relationship("Tenant")
+
+    def __repr__(self) -> str:
+        return f"<WhatsAppSettings tenant={self.tenant_id!r} phone={self.phone_number_id!r}>"
+
+
+class RegistrationToken(Base):
+    """
+    Short-lived token for WhatsApp-initiated user registration.
+
+    When an unknown phone number sends a message to the business number,
+    we create a token and send the user a registration link.  The token
+    pre-fills their phone and tenant context on the registration page.
+    """
+
+    __tablename__ = "registration_tokens"
+    __table_args__ = (
+        Index("ix_reg_token", "token", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), primary_key=True, default=_uuid
+    )
+    token: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    intake_phone_number_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<RegistrationToken phone={self.phone_number!r}>"
+
+
 # ---------------------------------------------------------------------------
 # FUTURE: Expert workflow tables (stubbed – not yet wired to routers)
 # ---------------------------------------------------------------------------

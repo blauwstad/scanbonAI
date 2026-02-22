@@ -1,10 +1,17 @@
 """
-WhatsApp webhook router for ScanbonAI.
+Multi-tenant WhatsApp webhook router for ScanbonAI.
 
 Endpoints
 ---------
-GET  /hook/whatsapp  – Webhook verification challenge (required by Meta).
-POST /hook/whatsapp  – Receive inbound WhatsApp messages.
+GET  /hook/whatsapp  -- Webhook verification challenge (required by Meta).
+POST /hook/whatsapp  -- Receive inbound WhatsApp messages.
+
+Multi-tenant routing
+--------------------
+Each inbound message is routed to the correct tenant by looking up the
+``phone_number_id`` from the payload metadata against the ``whatsapp_settings``
+table.  Verification tokens are also checked per-tenant so that multiple Meta
+Business accounts can share the same webhook URL.
 
 Idempotency
 -----------
@@ -14,31 +21,51 @@ already exists, preventing duplicate invoice creation on re-delivery.
 
 Security
 --------
-The POST handler validates the ``X-Hub-Signature-256`` HMAC header before
-doing any work.  Requests with missing or invalid signatures are rejected
-with 403 immediately.
+The POST handler validates the ``X-Hub-Signature-256`` HMAC header using
+``settings.META_APP_SECRET`` (the Meta App Secret shared across all tenants)
+before doing any work.  Requests with missing or invalid signatures are
+rejected with 403 immediately.
 
-FUTURE: When multi-tenant webhook routing is implemented, route the message
-to the correct tenant based on the ``WHATSAPP_PHONE_NUMBER_ID`` value in the
-payload (each tenant will have its own phone number ID).
+Unknown users
+-------------
+When a message arrives from an unrecognised phone number for a known tenant,
+we create a ``RegistrationToken`` and send the user a WhatsApp message
+containing a registration link.  This allows self-service onboarding while
+still maintaining tenant isolation.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import hashlib
+import hmac as hmac_mod
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.dependencies import get_db_session
-from app.models import WebhookEvent, WebhookEventStatus
+from app.models import (
+    RegistrationToken,
+    User,
+    WebhookEvent,
+    WebhookEventStatus,
+    WhatsAppSettings,
+)
 from app.schemas import WebhookPayload
-from app.services.whatsapp import WhatsAppClient
+from app.services.whatsapp import WhatsAppClient, decrypt_token
 
 logger = structlog.get_logger(__name__)
 
@@ -46,19 +73,27 @@ router = APIRouter(prefix="/hook", tags=["webhooks"])
 
 
 # ---------------------------------------------------------------------------
-# GET /hook/whatsapp – Meta verification handshake
+# GET /hook/whatsapp -- Meta verification handshake (multi-tenant)
 # ---------------------------------------------------------------------------
 
 
 @router.get("/whatsapp", summary="WhatsApp webhook verification")
-async def verify_webhook(request: Request) -> dict[str, Any]:
+async def verify_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
     """
     Respond to Meta's webhook verification challenge.
 
     Meta sends a GET request with three query parameters:
-    - ``hub.mode``         – must be ``"subscribe"``
-    - ``hub.verify_token`` – must match ``settings.WHATSAPP_VERIFY_TOKEN``
-    - ``hub.challenge``    – the value we must echo back as plain text
+
+    - ``hub.mode``         -- must be ``"subscribe"``
+    - ``hub.verify_token`` -- checked against ALL active WhatsAppSettings records
+    - ``hub.challenge``    -- the value we must echo back as plain text
+
+    The verify token is matched against the ``webhook_verify_token`` column in
+    the ``whatsapp_settings`` table.  If any active tenant record matches, the
+    challenge is echoed back; otherwise we return 403.
 
     Returns
     -------
@@ -68,7 +103,8 @@ async def verify_webhook(request: Request) -> dict[str, Any]:
     Raises
     ------
     403 Forbidden
-        If the verify token does not match or the mode is wrong.
+        If the verify token does not match any active tenant or the mode is
+        wrong.
     """
     params = request.query_params
     mode = params.get("hub.mode")
@@ -84,21 +120,69 @@ async def verify_webhook(request: Request) -> dict[str, Any]:
             detail=f"Unexpected hub.mode: {mode!r}",
         )
 
-    if token != settings.WHATSAPP_VERIFY_TOKEN:
+    # Look up the verify token against all active WhatsApp settings
+    result = await db.execute(
+        select(WhatsAppSettings).where(
+            WhatsAppSettings.webhook_verify_token == token,
+            WhatsAppSettings.is_active.is_(True),
+        )
+    )
+    wa_settings: WhatsAppSettings | None = result.scalars().first()
+
+    if wa_settings is None:
         log.warning("webhook.verify.bad_token")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Verify token mismatch.",
         )
 
-    log.info("webhook.verify.success")
+    log.info(
+        "webhook.verify.success",
+        tenant_id=wa_settings.tenant_id,
+        phone_number_id=wa_settings.phone_number_id,
+    )
     # Meta expects the challenge as a plain integer in the response body
     return int(challenge)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
-# POST /hook/whatsapp – Receive inbound messages
+# POST /hook/whatsapp -- Receive inbound messages (multi-tenant)
 # ---------------------------------------------------------------------------
+
+
+def _verify_meta_signature(payload: bytes, signature_header: str) -> bool:
+    """
+    Validate an inbound webhook payload against the X-Hub-Signature-256 header
+    using the Meta App Secret (shared across all tenants).
+
+    Parameters
+    ----------
+    payload:
+        Raw request body bytes.
+    signature_header:
+        Value of the ``X-Hub-Signature-256`` header, e.g.
+        ``"sha256=abc123..."``
+
+    Returns
+    -------
+    bool
+        ``True`` if the signature is valid, ``False`` otherwise.
+    """
+    if not signature_header.startswith("sha256="):
+        logger.warning("webhook.signature.bad_format")
+        return False
+
+    expected_hash = signature_header[len("sha256="):]
+    computed_hash = hmac_mod.new(
+        key=settings.META_APP_SECRET.encode(),
+        msg=payload,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    is_valid = hmac_mod.compare_digest(computed_hash, expected_hash)
+    if not is_valid:
+        logger.warning("webhook.signature.mismatch")
+    return is_valid
 
 
 @router.post(
@@ -114,26 +198,32 @@ async def receive_webhook(
     """
     Handle inbound WhatsApp Cloud API webhook deliveries.
 
-    Processing pipeline (asynchronous)
-    ------------------------------------
-    1. Validate the X-Hub-Signature-256 HMAC header.
+    Processing pipeline
+    -------------------
+    1. Validate the X-Hub-Signature-256 HMAC header using ``META_APP_SECRET``.
     2. Parse the payload.
-    3. For each message in the event:
+    3. For each entry/change, extract the ``phone_number_id`` from metadata and
+       resolve the owning tenant via the ``whatsapp_settings`` table.
+    4. For each message in the change:
        a. Check idempotency (``webhook_events`` table).
-       b. Store the event row.
-       c. Enqueue a Celery task for async image processing.
-    4. Return 200 immediately (WhatsApp requires a fast acknowledgement).
+       b. Store the event row (with ``tenant_id``).
+       c. Resolve the user by phone + tenant.
+       d. If user unknown: create a RegistrationToken and send a registration
+          link via WhatsApp.
+       e. If user known: enqueue a Celery task for async image processing
+          (passing ``tenant_id`` and ``phone_number_id``).
+    5. Return 200 immediately (WhatsApp requires a fast acknowledgement).
 
     Security
     --------
     Any request whose signature does not validate is rejected with 403
     **before** any database interaction.
     """
-    # --- Step 1: Validate HMAC signature ---
+    # --- Step 1: Validate HMAC signature using META_APP_SECRET ---
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    if not WhatsAppClient.verify_webhook_signature(raw_body, signature):
+    if not _verify_meta_signature(raw_body, signature):
         logger.warning(
             "webhook.receive.invalid_signature",
             path=str(request.url.path),
@@ -157,7 +247,46 @@ async def receive_webhook(
         for change in entry.changes:
             if change.field != "messages":
                 continue
+
             value = change.value
+
+            # --- Extract phone_number_id from metadata ---
+            metadata: dict[str, Any] = value.get("metadata", {})
+            phone_number_id: str = metadata.get("phone_number_id", "")
+
+            if not phone_number_id:
+                logger.warning(
+                    "webhook.receive.missing_phone_number_id",
+                    entry_id=entry.id,
+                )
+                continue
+
+            # --- Resolve tenant from phone_number_id ---
+            wa_result = await db.execute(
+                select(WhatsAppSettings).where(
+                    WhatsAppSettings.phone_number_id == phone_number_id,
+                    WhatsAppSettings.is_active.is_(True),
+                )
+            )
+            wa_settings: WhatsAppSettings | None = wa_result.scalars().first()
+
+            if wa_settings is None:
+                logger.warning(
+                    "webhook.receive.unknown_phone_number_id",
+                    phone_number_id=phone_number_id,
+                )
+                # Don't break the webhook -- Meta would retry on non-200
+                continue
+
+            tenant_id: str = wa_settings.tenant_id
+
+            log = logger.bind(
+                tenant_id=tenant_id,
+                phone_number_id=phone_number_id,
+            )
+            log.debug("webhook.receive.tenant_resolved")
+
+            # --- Process messages within this change ---
             messages: list[dict[str, Any]] = value.get("messages", [])
             contacts: list[dict[str, Any]] = value.get("contacts", [])
 
@@ -171,6 +300,9 @@ async def receive_webhook(
                     message=msg,
                     contact_name=contact_map.get(msg.get("from", ""), ""),
                     raw_value=value,
+                    tenant_id=tenant_id,
+                    phone_number_id=phone_number_id,
+                    wa_settings=wa_settings,
                     background_tasks=background_tasks,
                     db=db,
                 )
@@ -187,6 +319,9 @@ async def _handle_message(
     message: dict[str, Any],
     contact_name: str,
     raw_value: dict[str, Any],
+    tenant_id: str,
+    phone_number_id: str,
+    wa_settings: WhatsAppSettings,
     background_tasks: BackgroundTasks,
     db: AsyncSession,
 ) -> None:
@@ -201,6 +336,12 @@ async def _handle_message(
         Display name from the contacts block (may be empty).
     raw_value:
         Full ``value`` dict for the change (stored for debugging).
+    tenant_id:
+        Resolved tenant UUID for this message.
+    phone_number_id:
+        The business phone number ID that received this message.
+    wa_settings:
+        The WhatsAppSettings record for the resolved tenant.
     background_tasks:
         FastAPI background task queue.
     db:
@@ -210,7 +351,12 @@ async def _handle_message(
     phone: str = message.get("from", "")
     msg_type: str = message.get("type", "")
 
-    log = logger.bind(message_id=message_id, phone=phone[:4] + "****", type=msg_type)
+    log = logger.bind(
+        message_id=message_id,
+        phone=phone[:4] + "****" if len(phone) > 4 else phone,
+        type=msg_type,
+        tenant_id=tenant_id,
+    )
 
     if not message_id:
         log.warning("webhook.message.missing_id")
@@ -224,10 +370,11 @@ async def _handle_message(
         log.info("webhook.message.duplicate")
         return
 
-    # --- Persist webhook event ---
+    # --- Persist webhook event (with tenant_id) ---
     event = WebhookEvent(
         message_id=message_id,
         phone_number=phone,
+        tenant_id=tenant_id,
         raw_payload=raw_value,
         status=WebhookEventStatus.RECEIVED,
     )
@@ -238,6 +385,30 @@ async def _handle_message(
         # Race condition: another worker inserted the same message_id
         await db.rollback()
         log.info("webhook.message.duplicate_race")
+        return
+
+    # --- Resolve user by phone + tenant ---
+    user_result = await db.execute(
+        select(User).where(
+            User.whatsapp_phone == phone,
+            User.tenant_id == tenant_id,
+        )
+    )
+    user: User | None = user_result.scalars().first()
+
+    if user is None:
+        # Unknown user for this tenant -- send registration link
+        log.info(
+            "webhook.message.unknown_user",
+            contact_name=contact_name,
+        )
+        await _handle_unknown_user(
+            phone=phone,
+            tenant_id=tenant_id,
+            phone_number_id=phone_number_id,
+            wa_settings=wa_settings,
+            db=db,
+        )
         return
 
     # --- Route by message type ---
@@ -252,6 +423,7 @@ async def _handle_message(
                 media_id=media_id,
                 mime_type=mime_type,
                 contact=contact_name,
+                user_id=user.id,
             )
             # Enqueue Celery task for async processing
             background_tasks.add_task(
@@ -260,6 +432,8 @@ async def _handle_message(
                 phone=phone,
                 media_id=media_id,
                 mime_type=mime_type,
+                tenant_id=tenant_id,
+                phone_number_id=phone_number_id,
             )
         else:
             log.warning("webhook.message.image_no_media_id")
@@ -273,18 +447,129 @@ async def _handle_message(
         log.debug("webhook.message.unhandled_type")
 
 
+async def _handle_unknown_user(
+    phone: str,
+    tenant_id: str,
+    phone_number_id: str,
+    wa_settings: WhatsAppSettings,
+    db: AsyncSession,
+) -> None:
+    """
+    Handle an inbound message from a phone number not registered for this
+    tenant.
+
+    Creates a ``RegistrationToken`` and sends the user a WhatsApp message
+    containing a registration link so they can self-onboard.
+
+    Parameters
+    ----------
+    phone:
+        The sender's E.164 phone number (without '+').
+    tenant_id:
+        The resolved tenant UUID.
+    phone_number_id:
+        The business phone number ID that received the message.
+    wa_settings:
+        WhatsAppSettings record (contains encrypted access token).
+    db:
+        Active database session.
+    """
+    log = logger.bind(
+        phone=phone[:4] + "****" if len(phone) > 4 else phone,
+        tenant_id=tenant_id,
+        phone_number_id=phone_number_id,
+    )
+
+    # Create a registration token (48 bytes of URL-safe randomness)
+    token_value = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+    reg_token = RegistrationToken(
+        token=token_value,
+        phone_number=phone,
+        tenant_id=tenant_id,
+        intake_phone_number_id=phone_number_id,
+        expires_at=expires_at,
+    )
+    db.add(reg_token)
+
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Token collision (astronomically unlikely) -- log and bail
+        await db.rollback()
+        log.error("webhook.registration.token_collision")
+        return
+
+    # Build the registration URL
+    registration_url = (
+        f"{settings.PUBLIC_BASE_URL}/register/whatsapp?token={token_value}"
+    )
+
+    log.info(
+        "webhook.registration.token_created",
+        expires_at=expires_at.isoformat(),
+    )
+
+    # Send the registration link via WhatsApp using the tenant's credentials
+    try:
+        access_token = decrypt_token(wa_settings.access_token_encrypted)
+
+        async with WhatsAppClient(
+            access_token=access_token,
+            phone_number_id=phone_number_id,
+        ) as wa:
+            await wa.send_text_message(
+                phone=phone,
+                text=(
+                    "Welcome! You are not yet registered with this service.\n\n"
+                    "Please complete your registration using the link below "
+                    "(valid for 24 hours):\n\n"
+                    f"{registration_url}"
+                ),
+            )
+
+        log.info("webhook.registration.link_sent")
+
+    except Exception as exc:
+        # Never let send failures crash the webhook handler
+        log.error(
+            "webhook.registration.send_failed",
+            error=str(exc),
+        )
+
+
 def _enqueue_invoice_processing(
     message_id: str,
     phone: str,
     media_id: str,
     mime_type: str,
+    tenant_id: str,
+    phone_number_id: str,
 ) -> None:
     """
     Submit an invoice processing task to the Celery queue.
 
     This is called as a FastAPI BackgroundTask so it runs after the HTTP
-    response is sent.  The actual heavy work (download → quality check →
-    OCR → extraction) is done inside the Celery worker.
+    response is sent.  The actual heavy work (download -> quality check ->
+    OCR -> extraction) is done inside the Celery worker.
+
+    Parameters
+    ----------
+    message_id:
+        WhatsApp message ID for idempotency tracking.
+    phone:
+        Sender's E.164 phone number.
+    media_id:
+        WhatsApp media object ID to download.
+    mime_type:
+        Declared MIME type from the webhook payload.
+    tenant_id:
+        The resolved tenant UUID so the worker knows which tenant this
+        invoice belongs to.
+    phone_number_id:
+        The business phone number ID, so the worker can look up the
+        correct WhatsApp credentials for media download and replies.
     """
     try:
         from app.workers.ocr_worker import process_invoice  # local import to avoid circular
@@ -295,6 +580,8 @@ def _enqueue_invoice_processing(
                 "phone": phone,
                 "media_id": media_id,
                 "mime_type": mime_type,
+                "tenant_id": tenant_id,
+                "phone_number_id": phone_number_id,
             },
             countdown=1,  # slight delay to allow DB flush to propagate
         )
@@ -302,6 +589,8 @@ def _enqueue_invoice_processing(
             "webhook.task.enqueued",
             message_id=message_id,
             media_id=media_id,
+            tenant_id=tenant_id,
+            phone_number_id=phone_number_id,
         )
     except Exception as exc:
         # Never let task enqueue failures crash the webhook handler

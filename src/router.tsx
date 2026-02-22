@@ -6,6 +6,7 @@ import { AuthGuard } from "@/components/common/auth-guard";
 import { LoginPage } from "@/pages/auth/login-page";
 import { RegisterPage } from "@/pages/auth/register-page";
 import { VerifyPage } from "@/pages/auth/verify-page";
+import { RegisterWhatsAppPage } from "@/pages/auth/register-whatsapp-page";
 
 // User pages
 import { InvoiceListPage } from "@/pages/invoices/invoice-list-page";
@@ -17,6 +18,7 @@ import { AdminInvoiceListPage } from "@/pages/admin/admin-invoice-list-page";
 import { AdminInvoiceDetailPage } from "@/pages/admin/admin-invoice-detail-page";
 import { AdminMetricsPage } from "@/pages/admin/admin-metrics-page";
 import { AdminExportPage } from "@/pages/admin/admin-export-page";
+import { WhatsAppSetupPage } from "@/pages/admin/whatsapp-setup-page";
 
 export const router = createBrowserRouter([
   // Public routes
@@ -27,6 +29,10 @@ export const router = createBrowserRouter([
   {
     path: "/register",
     element: <RegisterPage />,
+  },
+  {
+    path: "/register/whatsapp",
+    element: <RegisterWhatsAppPage />,
   },
   {
     path: "/auth/verify",
@@ -79,6 +85,10 @@ export const router = createBrowserRouter([
       {
         path: "/admin/export",
         element: <AdminExportPage />,
+      },
+      {
+        path: "/admin/whatsapp",
+        element: <WhatsAppSetupPage />,
       },
     ],
   },

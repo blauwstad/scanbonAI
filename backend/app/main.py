@@ -39,7 +39,7 @@ from prometheus_client import make_asgi_app
 from app.config import settings
 from app.database import connect_db, disconnect_db
 from app.middleware import CorrelationIDMiddleware, TenantIsolationMiddleware
-from app.routers import admin, auth, invoices, signed_links, webhooks
+from app.routers import admin, auth, invoices, signed_links, webhooks, whatsapp_admin
 from app.schemas import ErrorResponse
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(auth.router)
     app.include_router(signed_links.router)
+    app.include_router(whatsapp_admin.router)
 
     # ------------------------------------------------------------------
     # Prometheus metrics endpoint

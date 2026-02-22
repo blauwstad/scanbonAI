@@ -1,6 +1,4 @@
 import {
-  LineChart,
-  Line,
   BarChart,
   Bar,
   XAxis,
@@ -8,7 +6,6 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  Legend,
 } from "recharts";
 import {
   Card,
@@ -26,14 +23,24 @@ import {
   Target,
 } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
-import type { AdminMetrics } from "@/types";
 
 // ─────────────────────────────────────────────────────────────
-// Types
+// Types – matches the backend MetricsResponse
 // ─────────────────────────────────────────────────────────────
+
+export interface BackendMetrics {
+  total_invoices: number;
+  invoices_by_status: Record<string, number>;
+  avg_confidence: number | null;
+  corrections_submitted: number;
+  approvals: number;
+  rejections: number;
+  period_start: string | null;
+  period_end: string | null;
+}
 
 interface AdminMetricsViewProps {
-  metrics: AdminMetrics | undefined;
+  metrics: BackendMetrics | undefined;
   isLoading: boolean;
 }
 
@@ -46,7 +53,6 @@ interface SummaryCardProps {
   value: string | number;
   description: string;
   icon: React.ElementType;
-  trend?: string;
 }
 
 function SummaryCard({
@@ -54,7 +60,6 @@ function SummaryCard({
   value,
   description,
   icon: Icon,
-  trend,
 }: SummaryCardProps) {
   return (
     <Card>
@@ -64,12 +69,7 @@ function SummaryCard({
       </CardHeader>
       <CardContent>
         <div className="text-2xl font-bold">{value}</div>
-        <p className="text-xs text-muted-foreground">
-          {description}
-          {trend && (
-            <span className="ml-1 text-green-600">{trend}</span>
-          )}
-        </p>
+        <p className="text-xs text-muted-foreground">{description}</p>
       </CardContent>
     </Card>
   );
@@ -91,8 +91,20 @@ export function AdminMetricsView({
     );
   }
 
-  const { summary, accuracy_over_time, field_corrections, processing_volume } =
-    metrics;
+  const total = metrics.total_invoices;
+  const byStatus = metrics.invoices_by_status ?? {};
+  const pending =
+    (byStatus["extracted"] ?? 0) + (byStatus["reviewed"] ?? 0);
+  const approved = metrics.approvals;
+  const qualityFailed = byStatus["quality_failed"] ?? 0;
+  const avgConf = metrics.avg_confidence ?? 0;
+  const corrections = metrics.corrections_submitted;
+
+  // Build a simple status breakdown for the bar chart
+  const statusData = Object.entries(byStatus).map(([status, count]) => ({
+    status: status.replace(/_/g, " "),
+    count,
+  }));
 
   return (
     <div className="space-y-6">
@@ -100,26 +112,26 @@ export function AdminMetricsView({
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <SummaryCard
           title="Total Invoices"
-          value={summary.total_invoices.toLocaleString()}
+          value={total.toLocaleString()}
           description="All time processed"
           icon={FileText}
         />
         <SummaryCard
           title="Pending Review"
-          value={summary.pending_review}
+          value={pending}
           description="Awaiting admin action"
           icon={Clock}
         />
         <SummaryCard
-          title="Accuracy Rate"
-          value={`${(summary.accuracy_rate * 100).toFixed(1)}%`}
-          description="AI extraction accuracy"
-          icon={Target}
+          title="Approved"
+          value={approved}
+          description="Successfully processed"
+          icon={CheckCircle}
         />
         <SummaryCard
-          title="Unreadable Rate"
-          value={`${((summary.unreadable / Math.max(summary.total_invoices, 1)) * 100).toFixed(1)}%`}
-          description={`${summary.unreadable} unreadable invoices`}
+          title="Quality Failed"
+          value={qualityFailed}
+          description="Unreadable images"
           icon={AlertCircle}
         />
       </div>
@@ -127,95 +139,40 @@ export function AdminMetricsView({
       {/* Additional stats row */}
       <div className="grid gap-4 md:grid-cols-3">
         <SummaryCard
-          title="Approved"
-          value={summary.approved}
-          description="Successfully processed"
-          icon={CheckCircle}
-        />
-        <SummaryCard
           title="Avg. Confidence"
-          value={`${(summary.average_confidence * 100).toFixed(1)}%`}
+          value={avgConf ? `${(avgConf * 100).toFixed(1)}%` : "N/A"}
           description="Mean extraction confidence"
           icon={TrendingUp}
         />
         <SummaryCard
-          title="Avg. Processing Time"
-          value={`${(summary.average_processing_time_ms / 1000).toFixed(1)}s`}
-          description="End-to-end extraction"
-          icon={Clock}
+          title="Corrections"
+          value={corrections}
+          description="User-submitted corrections"
+          icon={Target}
+        />
+        <SummaryCard
+          title="Rejections"
+          value={metrics.rejections}
+          description="Rejected by admin"
+          icon={AlertCircle}
         />
       </div>
 
-      {/* Charts row */}
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* Accuracy over time */}
+      {/* Status breakdown chart */}
+      {statusData.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle>Extraction Accuracy Over Time</CardTitle>
+            <CardTitle>Invoices by Status</CardTitle>
             <CardDescription>
-              Percentage of fields extracted correctly without user correction
+              Distribution of invoice processing statuses
             </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="h-[300px]">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={accuracy_over_time}>
+                <BarChart data={statusData}>
                   <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis
-                    dataKey="date"
-                    tick={{ fontSize: 11 }}
-                    tickFormatter={(v) => {
-                      const d = new Date(v);
-                      return `${d.getMonth() + 1}/${d.getDate()}`;
-                    }}
-                  />
-                  <YAxis
-                    domain={[0, 1]}
-                    tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                    tick={{ fontSize: 11 }}
-                  />
-                  <Tooltip
-                    formatter={(value) => [
-                      `${(Number(value) * 100).toFixed(1)}%`,
-                      "Accuracy",
-                    ]}
-                  />
-                  <Legend />
-                  <Line
-                    type="monotone"
-                    dataKey="accuracy"
-                    stroke="#4f46e5"
-                    strokeWidth={2}
-                    dot={{ r: 3 }}
-                    name="Accuracy"
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Processing volume */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Processing Volume</CardTitle>
-            <CardDescription>
-              Number of invoices processed per day
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={processing_volume}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis
-                    dataKey="date"
-                    tick={{ fontSize: 11 }}
-                    tickFormatter={(v) => {
-                      const d = new Date(v);
-                      return `${d.getMonth() + 1}/${d.getDate()}`;
-                    }}
-                  />
+                  <XAxis dataKey="status" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} />
                   <Tooltip />
                   <Bar
@@ -229,54 +186,16 @@ export function AdminMetricsView({
             </div>
           </CardContent>
         </Card>
-      </div>
+      )}
 
-      {/* Field corrections bar chart (full width) */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Most Corrected Fields</CardTitle>
-          <CardDescription>
-            Which fields get corrected by users most frequently
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={field_corrections}
-                layout="vertical"
-                margin={{ left: 100 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis
-                  type="number"
-                  tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
-                  domain={[0, 1]}
-                  tick={{ fontSize: 11 }}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="field_name"
-                  tick={{ fontSize: 11 }}
-                  width={90}
-                />
-                <Tooltip
-                  formatter={(value) => [
-                    `${(Number(value) * 100).toFixed(1)}%`,
-                    "Correction Rate",
-                  ]}
-                />
-                <Bar
-                  dataKey="correction_rate"
-                  fill="#f59e0b"
-                  radius={[0, 4, 4, 0]}
-                  name="Correction Rate"
-                />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+      {total === 0 && (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            No invoices yet. Invoices will appear here once users start
+            submitting them via WhatsApp.
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

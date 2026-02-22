@@ -6,10 +6,10 @@ Task pipeline
 ``process_invoice`` orchestrates the full processing pipeline:
 
   1. Resolve tenant + user from the phone number.
-  2. Download the image from WhatsApp.
+  2. Download the image from WhatsApp (using per-tenant credentials).
   3. Persist raw bytes to storage.
   4. Run image quality gates (blur / resolution / skew).
-  5. If quality passes → call OCR engine.
+  5. If quality passes -> call OCR engine.
   6. Extract structured metadata from OCR text.
   7. Persist all results to the database.
   8. Update invoice status and notify the user via WhatsApp.
@@ -34,9 +34,9 @@ retried independently and partial results are visible in real time.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from datetime import datetime, timezone
-from functools import wraps
 from typing import Any
 
 import structlog
@@ -102,6 +102,8 @@ def process_invoice(
     phone: str,
     media_id: str,
     mime_type: str,
+    tenant_id: str | None = None,
+    phone_number_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Full invoice processing pipeline triggered by a WhatsApp image message.
@@ -116,6 +118,10 @@ def process_invoice(
         WhatsApp media object ID to download.
     mime_type:
         Declared MIME type from the webhook payload.
+    tenant_id:
+        UUID of the tenant that owns the WhatsApp business number.
+    phone_number_id:
+        WhatsApp phone number ID used for per-tenant API calls.
 
     Returns
     -------
@@ -140,6 +146,8 @@ def process_invoice(
             phone=phone,
             media_id=media_id,
             mime_type=mime_type,
+            tenant_id=tenant_id,
+            phone_number_id=phone_number_id,
             log=log,
         ))
         log.info("ocr_worker.task.complete", invoice_id=result.get("invoice_id"))
@@ -163,6 +171,8 @@ async def _process_invoice_async(
     phone: str,
     media_id: str,
     mime_type: str,
+    tenant_id: str | None,
+    phone_number_id: str | None,
     log: Any,
 ) -> dict[str, Any]:
     """
@@ -180,6 +190,7 @@ async def _process_invoice_async(
         QualityCheck,
         Tenant,
         User,
+        WhatsAppSettings,
         WebhookEvent,
         WebhookEventStatus,
     )
@@ -187,11 +198,37 @@ async def _process_invoice_async(
     from app.services.quality_check import assess_quality
     from app.services.signed_urls import build_signed_url, SignedLinkType as SLT
     from app.services.storage import save_invoice_image
-    from app.services.whatsapp import WhatsAppClient
+    from app.services.whatsapp import WhatsAppClient, decrypt_token
     from app.services.extraction import extract_invoice_metadata
     from sqlalchemy import select
 
     async with async_session() as db:
+
+        # ------------------------------------------------------------------
+        # Step 0: Resolve per-tenant WhatsApp credentials
+        # ------------------------------------------------------------------
+        wa_client_kwargs: dict[str, str] | None = None
+
+        if tenant_id and phone_number_id:
+            wa_settings_result = await db.execute(
+                select(WhatsAppSettings).where(
+                    WhatsAppSettings.tenant_id == tenant_id,
+                    WhatsAppSettings.is_active.is_(True),
+                )
+            )
+            wa_settings = wa_settings_result.scalars().first()
+            if wa_settings:
+                access_token = decrypt_token(wa_settings.access_token_encrypted)
+                wa_client_kwargs = {
+                    "access_token": access_token,
+                    "phone_number_id": phone_number_id,
+                }
+            else:
+                log.warning(
+                    "ocr_worker.no_whatsapp_settings",
+                    tenant_id=tenant_id,
+                    hint="Will process invoice but skip WhatsApp notifications.",
+                )
 
         # ------------------------------------------------------------------
         # Step 1: Resolve user and tenant from phone number
@@ -200,8 +237,7 @@ async def _process_invoice_async(
 
         user_result = await db.execute(
             select(User).where(
-                User.phone_number == phone,
-                User.is_active.is_(True),
+                User.whatsapp_phone == phone,
             )
         )
         user: User | None = user_result.scalars().first()
@@ -214,7 +250,6 @@ async def _process_invoice_async(
         tenant_result = await db.execute(
             select(Tenant).where(
                 Tenant.id == user.tenant_id,
-                Tenant.is_active.is_(True),
             )
         )
         tenant: Tenant | None = tenant_result.scalars().first()
@@ -230,14 +265,17 @@ async def _process_invoice_async(
         # Step 2: Create invoice record
         # ------------------------------------------------------------------
         invoice_id = str(uuid.uuid4())
+        file_hash_value = ""  # placeholder; computed after download
         invoice = Invoice(
             id=invoice_id,
             tenant_id=tenant.id,
             user_id=user.id,
-            whatsapp_media_id=media_id,
-            mime_type=mime_type,
-            status=InvoiceStatus.OCR_PENDING,
-            month=datetime.now(tz=timezone.utc).strftime("%Y-%m"),
+            file_path="",  # placeholder; set after storage
+            file_hash=file_hash_value,
+            status=InvoiceStatus.PROCESSING,
+            upload_source="whatsapp",
+            whatsapp_message_id=message_id,
+            month_partition=datetime.now(tz=timezone.utc).strftime("%Y-%m"),
         )
         db.add(invoice)
         await db.flush()
@@ -248,15 +286,21 @@ async def _process_invoice_async(
         # ------------------------------------------------------------------
         log.debug("ocr_worker.step3.download")
         try:
-            async with WhatsAppClient() as wa:
-                image_bytes = await wa.download_media(media_id)
+            if wa_client_kwargs:
+                async with WhatsAppClient(**wa_client_kwargs) as wa:
+                    image_bytes = await wa.download_media(media_id)
+            else:
+                log.warning("ocr_worker.download.no_credentials")
+                raise RuntimeError("No WhatsApp credentials available for media download.")
         except Exception as exc:
             log.error("ocr_worker.download_failed", error=str(exc))
-            invoice.status = InvoiceStatus.OCR_FAILED
+            invoice.status = InvoiceStatus.QUALITY_FAILED
             await db.commit()
             return {"status": "error", "reason": "download_failed", "invoice_id": invoice_id}
 
-        invoice.file_size_bytes = len(image_bytes)
+        # Compute file hash
+        file_hash_value = hashlib.sha256(image_bytes).hexdigest()
+        invoice.file_hash = file_hash_value
 
         # ------------------------------------------------------------------
         # Step 4: Persist image to storage
@@ -270,17 +314,21 @@ async def _process_invoice_async(
                 invoice_id=invoice_id,
                 mime_type=mime_type,
             )
-            invoice.storage_path = storage_path
+            invoice.file_path = storage_path
         except ValueError as exc:
             log.warning("ocr_worker.storage_rejected", reason=str(exc))
             invoice.status = InvoiceStatus.QUALITY_FAILED
             await db.commit()
-            # Notify user
-            async with WhatsAppClient() as wa:
-                await wa.send_text_message(
-                    phone,
-                    f"Your invoice could not be processed: {exc}",
-                )
+            # Notify user (if credentials available)
+            if wa_client_kwargs:
+                try:
+                    async with WhatsAppClient(**wa_client_kwargs) as wa:
+                        await wa.send_text_message(
+                            phone,
+                            f"Your invoice could not be processed: {exc}",
+                        )
+                except Exception:
+                    log.warning("ocr_worker.notify_failed_on_storage_reject")
             return {"status": "rejected", "reason": str(exc), "invoice_id": invoice_id}
 
         # ------------------------------------------------------------------
@@ -305,7 +353,7 @@ async def _process_invoice_async(
             blur_score=quality_result.blur_score,
             resolution_ok=quality_result.resolution_ok,
             skew_angle=quality_result.skew_angle,
-            passed=quality_result.passed,
+            overall_pass=quality_result.passed,
             failure_reasons=quality_result.failure_reasons,
         )
         db.add(qc)
@@ -314,12 +362,16 @@ async def _process_invoice_async(
             invoice.status = InvoiceStatus.QUALITY_FAILED
             await db.commit()
             reasons = "; ".join(quality_result.failure_reasons)
-            async with WhatsAppClient() as wa:
-                await wa.send_text_message(
-                    phone,
-                    f"Your invoice image failed quality checks: {reasons}\n"
-                    "Please send a clearer photo.",
-                )
+            if wa_client_kwargs:
+                try:
+                    async with WhatsAppClient(**wa_client_kwargs) as wa:
+                        await wa.send_text_message(
+                            phone,
+                            f"Your invoice image failed quality checks: {reasons}\n"
+                            "Please send a clearer photo.",
+                        )
+                except Exception:
+                    log.warning("ocr_worker.notify_failed_on_quality_fail")
             return {
                 "status": "quality_failed",
                 "reasons": quality_result.failure_reasons,
@@ -330,7 +382,7 @@ async def _process_invoice_async(
         # Step 6: OCR
         # ------------------------------------------------------------------
         log.debug("ocr_worker.step6.ocr")
-        invoice.status = InvoiceStatus.OCR_PENDING
+        invoice.status = InvoiceStatus.PROCESSING
         await db.flush()
 
         abs_path = storage_path  # relative path; resolve to absolute
@@ -342,7 +394,7 @@ async def _process_invoice_async(
             ocr_result = await ocr_adapter.extract_text(abs_path)
         except Exception as exc:
             log.error("ocr_worker.ocr_failed", error=str(exc))
-            invoice.status = InvoiceStatus.OCR_FAILED
+            invoice.status = InvoiceStatus.QUALITY_FAILED
             await db.commit()
             return {"status": "ocr_failed", "invoice_id": invoice_id}
         finally:
@@ -350,19 +402,19 @@ async def _process_invoice_async(
 
         ocr_row = OCRResultModel(
             invoice_id=invoice_id,
-            engine=ocr_result.engine,
             raw_text=ocr_result.raw_text,
-            raw_response=ocr_result.raw_response,
-            confidence=ocr_result.confidence,
-            processing_ms=ocr_result.processing_ms,
+            model_name=ocr_result.engine,
+            model_version="v1",
+            processing_time_ms=ocr_result.processing_ms,
         )
         db.add(ocr_row)
+        await db.flush()
 
         # ------------------------------------------------------------------
         # Step 7: Extraction
         # ------------------------------------------------------------------
         log.debug("ocr_worker.step7.extraction")
-        invoice.status = InvoiceStatus.EXTRACTION_PENDING
+        invoice.status = InvoiceStatus.PROCESSING
         await db.flush()
 
         try:
@@ -382,11 +434,22 @@ async def _process_invoice_async(
                     parsed_date = datetime.strptime(
                         metadata.invoice_date.value, "%Y-%m-%d"
                     )
-                    invoice.month = parsed_date.strftime("%Y-%m")
+                    invoice.month_partition = parsed_date.strftime("%Y-%m")
                 except ValueError:
                     pass
 
-            field_confidence = {
+            extracted_json = {
+                "vendor_name": metadata.vendor_name.value,
+                "vendor_tax_id": metadata.vendor_tax_id.value,
+                "invoice_number": metadata.invoice_number.value,
+                "invoice_date": metadata.invoice_date.value,
+                "total_amount": metadata.total_amount.value,
+                "tax_amount": metadata.tax_amount.value,
+                "currency": metadata.currency.value,
+                "line_items": metadata.line_items,
+            }
+
+            confidence_scores = {
                 "vendor_name": metadata.vendor_name.confidence,
                 "vendor_tax_id": metadata.vendor_tax_id.confidence,
                 "invoice_number": metadata.invoice_number.confidence,
@@ -394,31 +457,26 @@ async def _process_invoice_async(
                 "total_amount": metadata.total_amount.confidence,
                 "tax_amount": metadata.tax_amount.confidence,
                 "currency": metadata.currency.confidence,
+                "overall": metadata.overall_confidence,
             }
 
             extracted = ExtractedData(
                 invoice_id=invoice_id,
-                vendor_name=metadata.vendor_name.value,
-                vendor_tax_id=metadata.vendor_tax_id.value,
-                invoice_number=metadata.invoice_number.value,
-                invoice_date=metadata.invoice_date.value,
-                total_amount=metadata.total_amount.value,
-                tax_amount=metadata.tax_amount.value,
-                currency=metadata.currency.value,
-                line_items=metadata.line_items,
-                field_confidence=field_confidence,
-                overall_confidence=metadata.overall_confidence,
+                ocr_result_id=ocr_row.invoice_id,
+                extracted_json=extracted_json,
+                confidence_scores=confidence_scores,
+                extraction_version="v1",
             )
             db.add(extracted)
 
-        invoice.status = InvoiceStatus.AWAITING_USER_REVIEW
+        invoice.status = InvoiceStatus.EXTRACTED
         await db.flush()
 
         # ------------------------------------------------------------------
         # Step 8: Notify user with signed review link
         # ------------------------------------------------------------------
         signed_url = build_signed_url(
-            base_url="https://app.scanbonai.com",
+            base_url=settings.PUBLIC_BASE_URL,
             invoice_id=invoice_id,
             user_id=user.id,
             tenant_id=tenant.id,
@@ -430,12 +488,13 @@ async def _process_invoice_async(
             f"{signed_url}\n\n"
             "Tap the link to confirm or correct the details."
         )
-        try:
-            async with WhatsAppClient() as wa:
-                await wa.send_text_message(phone=phone, text=notify_text)
-        except Exception as exc:
-            log.warning("ocr_worker.notify_failed", error=str(exc))
-            # Non-fatal: don't fail the task because a WhatsApp message failed
+        if wa_client_kwargs:
+            try:
+                async with WhatsAppClient(**wa_client_kwargs) as wa:
+                    await wa.send_text_message(phone=phone, text=notify_text)
+            except Exception as exc:
+                log.warning("ocr_worker.notify_failed", error=str(exc))
+                # Non-fatal: don't fail the task because a WhatsApp message failed
 
         # ------------------------------------------------------------------
         # Step 9: Mark webhook event as processed

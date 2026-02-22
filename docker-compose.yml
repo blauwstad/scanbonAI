@@ -1,0 +1,310 @@
+# =============================================================================
+# ScanbonAI – Docker Compose (Dokploy-compatible)
+# =============================================================================
+# Usage (local):
+#   cp .env.example .env          # fill in real values
+#   docker compose up -d
+#   docker compose exec api alembic upgrade head
+#
+# Usage (Dokploy):
+#   Paste this file into a new Compose application.
+#   All bind-mount host paths must be pre-created on the VPS:
+#     sudo mkdir -p /data/scanbonai/{postgres,redis,invoices,backups}
+#     sudo chown -R 1000:1000 /data/scanbonai
+# =============================================================================
+
+name: scanbonai
+
+# ---------------------------------------------------------------------------
+# Shared extension anchors – avoids repeating limits / labels
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-restart: &on-failure
+  restart: on-failure
+
+x-api-build: &api-build
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL 16 – primary datastore
+  # --------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    <<: *on-failure
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scanbonai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-scanbonai}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - /data/scanbonai/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scanbonai} -d ${POSTGRES_DB:-scanbonai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - backend
+    # db must NOT be exposed to the public network
+    expose:
+      - "5432"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # Redis 7 – Celery broker + result backend + cache
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    <<: *on-failure
+    command: >
+      redis-server
+      --save 60 1
+      --loglevel warning
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - /data/scanbonai/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - backend
+    expose:
+      - "6379"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 320M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # FastAPI backend – HTTP API + webhook receiver
+  # --------------------------------------------------------------------------
+  api:
+    <<: [*api-build, *on-failure]
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+      --loop uvloop
+      --no-access-log
+    env_file:
+      - .env
+    environment:
+      # Override STORAGE_PATH to match the bind-mount target
+      STORAGE_PATH: /data/invoices
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /data/scanbonai/invoices:/data/invoices
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - backend
+      - frontend
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # Celery worker – background invoice processing / OCR pipeline
+  # --------------------------------------------------------------------------
+  worker:
+    <<: [*api-build, *on-failure]
+    command: >
+      celery -A app.workers worker
+      --loglevel=info
+      --concurrency=2
+      --max-tasks-per-child=100
+    env_file:
+      - .env
+    environment:
+      STORAGE_PATH: /data/invoices
+    volumes:
+      - /data/scanbonai/invoices:/data/invoices
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # React / Vite frontend – multi-stage build (node build -> nginx serve)
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    <<: *on-failure
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # Nginx reverse proxy – TLS termination + routing
+  # --------------------------------------------------------------------------
+  proxy:
+    image: nginx:1.27-alpine
+    <<: *on-failure
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # SSL certificates – provision via Dokploy "Domains" tab (Let's Encrypt)
+      # or mount your own certs at the paths referenced in nginx.conf:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+        reservations:
+          cpus: "0.05"
+          memory: 16M
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # FUTURE SERVICE PLACEHOLDERS
+  # --------------------------------------------------------------------------
+  # Uncomment and configure when these services are ready for deployment.
+
+  # payments-webhook:
+  #   <<: [*api-build, *on-failure]
+  #   command: uvicorn app.payments.webhook:app --host 0.0.0.0 --port 8001
+  #   env_file: .env
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - backend
+  #     - frontend
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.5"
+  #         memory: 256M
+
+  # expert-scoring-worker:
+  #   <<: [*api-build, *on-failure]
+  #   command: celery -A app.workers.expert_scoring worker -Q expert_scoring -l info
+  #   env_file: .env
+  #   environment:
+  #     EXPERT_POOL_ENABLED: "true"
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - backend
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "2.0"
+  #         memory: 1G
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  backend:
+    driver: bridge
+    internal: true   # no direct internet access from db / redis / worker
+  frontend:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Named volumes (optional – only used if you prefer Docker-managed volumes
+# instead of the bind mounts above; bind mounts are the Dokploy default)
+# ---------------------------------------------------------------------------
+# volumes:
+#   postgres_data:
+#   redis_data:
+#   invoice_data:

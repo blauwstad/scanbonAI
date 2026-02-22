@@ -1,0 +1,149 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://scanbonai.com/schemas/invoice-metadata/v1",
+  "title": "ScanbonAI Invoice Metadata",
+  "description": "Structured data extracted from a scanned invoice image, with per-field confidence scores.",
+  "type": "object",
+  "required": [
+    "supplier",
+    "invoice_number",
+    "invoice_date",
+    "due_date",
+    "payment_terms",
+    "currency",
+    "subtotal",
+    "vat_amount",
+    "vat_rate",
+    "total_amount",
+    "line_items",
+    "category_suggestion",
+    "booking_suggestion",
+    "metadata"
+  ],
+  "definitions": {
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Confidence score from 0.0 (no confidence) to 1.0 (certain)."
+    },
+    "field_string": {
+      "type": "object",
+      "required": ["value", "confidence"],
+      "properties": {
+        "value": { "type": ["string", "null"] },
+        "confidence": { "$ref": "#/definitions/confidence" }
+      },
+      "additionalProperties": false
+    },
+    "field_number": {
+      "type": "object",
+      "required": ["value", "confidence"],
+      "properties": {
+        "value": { "type": ["number", "null"] },
+        "confidence": { "$ref": "#/definitions/confidence" }
+      },
+      "additionalProperties": false
+    },
+    "supplier": {
+      "type": "object",
+      "required": ["name", "address", "country", "vat_id", "kvk_coc", "iban"],
+      "properties": {
+        "name":    { "$ref": "#/definitions/field_string" },
+        "address": { "$ref": "#/definitions/field_string" },
+        "country": {
+          "allOf": [{ "$ref": "#/definitions/field_string" }],
+          "description": "ISO 3166-1 alpha-2 country code"
+        },
+        "vat_id":  { "$ref": "#/definitions/field_string" },
+        "kvk_coc": {
+          "allOf": [{ "$ref": "#/definitions/field_string" }],
+          "description": "Dutch KVK / Chamber of Commerce number"
+        },
+        "iban":    { "$ref": "#/definitions/field_string" }
+      },
+      "additionalProperties": false
+    },
+    "line_item": {
+      "type": "object",
+      "required": ["description", "quantity", "unit_price", "vat_rate", "amount"],
+      "properties": {
+        "description": { "$ref": "#/definitions/field_string" },
+        "quantity":    { "$ref": "#/definitions/field_number" },
+        "unit_price":  { "$ref": "#/definitions/field_number" },
+        "vat_rate":    {
+          "allOf": [{ "$ref": "#/definitions/field_number" }],
+          "description": "VAT percentage, e.g. 21.0 for 21%"
+        },
+        "amount":      { "$ref": "#/definitions/field_number" }
+      },
+      "additionalProperties": false
+    },
+    "category_suggestion": {
+      "type": "object",
+      "required": ["category", "confidence"],
+      "properties": {
+        "category":   { "type": "string" },
+        "confidence": { "$ref": "#/definitions/confidence" }
+      },
+      "additionalProperties": false
+    },
+    "booking_suggestion": {
+      "type": "object",
+      "required": ["account_code", "cost_center", "tax_treatment", "confidence"],
+      "properties": {
+        "account_code":  { "type": "string" },
+        "cost_center":   { "type": ["string", "null"] },
+        "tax_treatment": { "type": "string" },
+        "confidence":    { "$ref": "#/definitions/confidence" }
+      },
+      "additionalProperties": false
+    },
+    "extraction_metadata": {
+      "type": "object",
+      "required": ["ocr_model", "extraction_version", "processing_timestamp"],
+      "properties": {
+        "ocr_model":            { "type": "string" },
+        "extraction_version":   { "type": "string" },
+        "processing_timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "supplier":            { "$ref": "#/definitions/supplier" },
+    "invoice_number":      { "$ref": "#/definitions/field_string" },
+    "invoice_date":        {
+      "allOf": [{ "$ref": "#/definitions/field_string" }],
+      "description": "ISO 8601 date string YYYY-MM-DD"
+    },
+    "due_date":            {
+      "allOf": [{ "$ref": "#/definitions/field_string" }],
+      "description": "ISO 8601 date string YYYY-MM-DD"
+    },
+    "payment_terms":       { "$ref": "#/definitions/field_string" },
+    "currency":            {
+      "allOf": [{ "$ref": "#/definitions/field_string" }],
+      "description": "ISO 4217 currency code"
+    },
+    "subtotal":            { "$ref": "#/definitions/field_number" },
+    "vat_amount":          { "$ref": "#/definitions/field_number" },
+    "vat_rate":            {
+      "allOf": [{ "$ref": "#/definitions/field_number" }],
+      "description": "Primary VAT rate as percentage, e.g. 21.0"
+    },
+    "total_amount":        { "$ref": "#/definitions/field_number" },
+    "line_items": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/line_item" },
+      "minItems": 0
+    },
+    "category_suggestion": { "$ref": "#/definitions/category_suggestion" },
+    "booking_suggestion":  { "$ref": "#/definitions/booking_suggestion" },
+    "metadata":            { "$ref": "#/definitions/extraction_metadata" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/settings-schema.json",
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(docker compose *)",
+      "Bash(pytest *)",
+      "Bash(ruff *)",
+      "Bash(ls *)",
+      "Bash(tree *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(alembic *)"
+    ],
+    "deny": [
+      "Bash(cat .env)",
+      "Bash(cat */.env*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)"
+    ]
+  }
+}

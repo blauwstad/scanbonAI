@@ -106,6 +106,7 @@ class InvoiceStatusResponse(BaseModel):
 class GatewayStatusResponse(BaseModel):
     gateway_reachable: bool
     gateway_url: str
+    dashboard_url: str = ""
     phone_number: str = "+31618395043"
     error: str | None = None
 
@@ -561,10 +562,12 @@ async def _check_gateway_health() -> GatewayStatusResponse:
     Call the OpenClaw gateway /health endpoint and return the result.
     """
     gateway_url = settings.OPENCLAW_GATEWAY_URL
+    dashboard_url = f"{settings.PUBLIC_BASE_URL}/openclaw/"
     if not gateway_url:
         return GatewayStatusResponse(
             gateway_reachable=False,
             gateway_url="",
+            dashboard_url=dashboard_url,
             error="OPENCLAW_GATEWAY_URL is not configured.",
         )
 
@@ -590,6 +593,7 @@ async def _check_gateway_health() -> GatewayStatusResponse:
             return GatewayStatusResponse(
                 gateway_reachable=reachable,
                 gateway_url=gateway_url,
+                dashboard_url=dashboard_url,
                 error=None if reachable else f"Gateway returned HTTP {response.status_code}",
             )
     except httpx.RequestError as exc:
@@ -601,6 +605,7 @@ async def _check_gateway_health() -> GatewayStatusResponse:
         return GatewayStatusResponse(
             gateway_reachable=False,
             gateway_url=gateway_url,
+            dashboard_url=dashboard_url,
             error=str(exc),
         )
 

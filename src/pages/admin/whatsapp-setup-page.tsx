@@ -25,6 +25,7 @@ import {
 interface OpenClawStatus {
   gateway_reachable: boolean;
   gateway_url: string;
+  dashboard_url?: string;
   phone_number: string;
   last_seen?: string;
   session_active?: boolean;
@@ -171,18 +172,25 @@ export function WhatsAppSetupPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
-              <span className="text-sm text-muted-foreground">Gateway URL</span>
-              <span className="text-sm font-medium font-mono">
-                {status?.gateway_url ?? "N/A"}
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between">
               <span className="text-sm text-muted-foreground">Reachable</span>
               <Badge variant={isConnected ? "success" : "destructive"}>
                 {isConnected ? "Yes" : "No"}
               </Badge>
             </div>
+
+            {status?.dashboard_url && (
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">Dashboard</span>
+                <a
+                  href={status.dashboard_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sm font-medium text-primary hover:underline"
+                >
+                  Open OpenClaw Dashboard
+                </a>
+              </div>
+            )}
 
             {status?.session_active !== undefined && (
               <div className="flex items-center justify-between">
